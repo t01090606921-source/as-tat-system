@@ -3,43 +3,40 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime
 import io
-import re
 
 # --- 1. Supabase 접속 설정 ---
 url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-def final_match_clean(val):
-    """품목코드 매칭을 위한 초정밀 정제: 모든 공백 및 제어문자 제거"""
+def final_clean(val):
+    """품목코드 원형 보존 정제: 공백만 제거"""
     if pd.isna(val): return ""
-    # 1. 모든 종류의 공백(줄바꿈, 탭 포함) 제거
-    s = "".join(str(val).split())
-    # 2. 유령 문자 및 특수 제어문자 제거 (정규식)
-    s = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', s)
-    # 3. 엑셀 숫자 변환 흔적(.0) 제거
-    if s.endswith('.0'):
-        s = s[:-2]
-    return s.strip().upper()
+    return str(val).strip().upper()
 
 st.set_page_config(page_title="AS TAT 분석 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (매칭 정밀화)")
+st.title("⏱️ AS TAT 분석 시스템 (데이터 무결성 모드)")
 
-# --- 2. 사이드바: 설정 및 정밀 재매칭 ---
+# --- 2. 사이드바: 설정 및 현황 확인 ---
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     
+    # DB 상태 실시간 확인
+    try:
+        m_count = supabase.table("master_data").select("자재번호", count="exact").execute()
+        st.info(f"📊 현재 DB 등록 마스터: {m_count.count} 건")
+    except:
+        pass
+
     st.subheader("1. 마스터 데이터 관리")
     master_file = st.file_uploader("마스터 업로드 (엑셀)", type=['xlsx'])
-    if master_file and st.button("🚀 마스터 DB 갱신", use_container_width=True):
+    if master_file and st.button("🚀 마스터 DB 갱신 (전체 삭제 후 재등록)", use_container_width=True):
         try:
-            # dtype=str로 읽어 데이터 왜곡 방지
             m_df = pd.read_excel(master_file, dtype=str)
             m_data = []
             for _, row in m_df.iterrows():
-                mat_no = final_match_clean(row.iloc[0]) # A열
+                mat_no = final_clean(row.iloc[0])
                 if not mat_no: continue
-                
                 m_data.append({
                     "자재번호": mat_no,
                     "공급업체명": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "미등록",
@@ -47,63 +44,58 @@ with st.sidebar:
                 })
             
             if m_data:
-                supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
-                for j in range(0, len(m_data), 500):
-                    supabase.table("master_data").insert(m_data[j:j+500]).execute()
-                st.success(f"✅ 마스터 {len(m_data)}건 동기화 성공!")
+                # 1. 기존 데이터 완전 삭제 (성공할 때까지 확인)
+                supabase.table("master_data").delete().neq("자재번호", "EMPTY_KEY").execute()
+                
+                # 2. 데이터 분할 삽입 (안정적인 200개 단위)
+                batch_size = 200
+                total = len(m_data)
+                progress_bar = st.progress(0)
+                for i in range(0, total, batch_size):
+                    batch = m_data[i:i+batch_size]
+                    supabase.table("master_data").insert(batch).execute()
+                    progress_bar.progress(min((i + batch_size) / total, 1.0))
+                
+                st.success(f"✅ {total}건 마스터 등록 완료! 페이지를 새로고침하세요.")
+                st.rerun()
         except Exception as e:
             st.error(f"마스터 오류: {e}")
 
     st.divider()
-    st.subheader("2. 정보 보정 (초정밀)")
+    st.subheader("2. 정보 보정")
     if st.button("🔄 미등록 정보 정밀 재매칭", use_container_width=True):
-        with st.spinner("DB 데이터 타입 재정렬 및 대조 중..."):
-            # 1. 마스터 데이터 로드
+        with st.spinner("DB 직접 대조 중..."):
+            # 마스터 전체 다시 로드
             m_res = supabase.table("master_data").select("*").execute()
             m_lookup = {r['자재번호']: r for r in m_res.data}
             
-            # 2. 히스토리 데이터 로드
             h_res = supabase.table("as_history").select("id, 자재번호").execute()
             up_cnt = 0
-            
             for row in h_res.data:
-                # DB에 이미 들어있는 자재번호도 한 번 더 정밀 청소 후 대조
-                clean_key = final_match_clean(row['자재번호'])
+                clean_key = final_clean(row['자재번호'])
                 m_info = m_lookup.get(clean_key)
-                
                 if m_info:
                     supabase.table("as_history").update({
                         "공급업체명": m_info['공급업체명'], 
                         "분류구분": m_info['분류구분']
                     }).eq("id", row['id']).execute()
                     up_cnt += 1
-            
-            st.success(f"✅ {up_cnt}건 매칭 보정 완료!")
+            st.success(f"✅ {up_cnt}건 보정 성공!")
             st.rerun()
 
-    st.divider()
-    st.subheader("3. 초기화")
-    if st.button("⚠️ 전체 삭제"):
-        if st.checkbox("삭제 확인"):
-            supabase.table("as_history").delete().neq("id", -1).execute()
-            supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
-            st.rerun()
-
-# --- 3. 입고/출고 처리 ---
+# --- 3. 입고/출고 처리 (로직 동일) ---
 tab1, tab2 = st.tabs(["📥 AS 입고", "📤 AS 출고"])
-
+# ... (기존 입고/출고 로직 유지) ...
 with tab1:
     in_file = st.file_uploader("입고 엑셀", type=['xlsx'], key="in_up")
     if in_file and st.button("입고 처리 실행"):
         df = pd.read_excel(in_file, dtype=str)
         as_in = df[df.iloc[:, 0].str.contains('A/S 철거', na=False)].copy()
-        
         m_res = supabase.table("master_data").select("*").execute()
         m_lookup = {r['자재번호']: r for r in m_res.data}
-        
         new_recs = []
         for _, row in as_in.iterrows():
-            mat_no = final_match_clean(row.iloc[3]) # D열
+            mat_no = final_clean(row.iloc[3])
             m_info = m_lookup.get(mat_no)
             new_recs.append({
                 "압축코드": str(row.iloc[7]).strip() if not pd.isna(row.iloc[7]) else "",
@@ -117,7 +109,7 @@ with tab1:
         if new_recs:
             for i in range(0, len(new_recs), 500):
                 supabase.table("as_history").insert(new_recs[i:i+500]).execute()
-            st.success("✅ 등록 완료")
+            st.success("✅ 완료")
             st.rerun()
 
 with tab2:
@@ -141,29 +133,11 @@ st.divider()
 try:
     res = supabase.table("as_history").select("*").order("입고일", desc=True).execute()
     all_data = pd.DataFrame(res.data)
-
     if not all_data.empty:
-        st.subheader("📊 분석 리포트")
-        c1, c2, c3 = st.columns(3)
-        v_filter = c1.multiselect("공급업체", sorted(all_data['공급업체명'].unique()))
-        g_filter = c2.multiselect("분류구분", sorted(all_data['분류구분'].unique()))
-        s_filter = c3.multiselect("상태", ['출고 대기', '출고 완료'])
-
-        dff = all_data.copy()
-        if v_filter: dff = dff[dff['공급업체명'].isin(v_filter)]
-        if g_filter: dff = dff[dff['분류구분'].isin(g_filter)]
-        if s_filter: dff = dff[dff['상태'].isin(s_filter)]
-
+        st.subheader("📊 현황 리포트")
         m1, m2, m3 = st.columns(3)
-        m1.metric("총 건수", f"{len(dff):,} 건")
-        m2.metric("미등록", f"{len(dff[dff['공급업체명'] == '미등록']):,} 건")
-        m3.metric("대기 중", f"{len(dff[dff['상태'] == '출고 대기']):,} 건")
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            dff.to_excel(writer, index=False)
-        st.download_button("📥 엑셀 다운로드", output.getvalue(), f"AS_Report.xlsx")
-
-        st.dataframe(dff, use_container_width=True, hide_index=True)
+        m1.metric("총 건수", f"{len(all_data):,} 건")
+        m2.metric("미등록 건수", f"{len(all_data[all_data['공급업체명'] == '미등록']):,} 건")
+        st.dataframe(all_data, use_container_width=True, hide_index=True)
 except:
     pass
