@@ -12,19 +12,16 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 def ultimate_clean(val):
-    """자재번호의 모든 잠재적 불일치 요소 제거"""
+    """자재번호의 모든 잠재적 불일치 요소 제거 (공백, 제어문자, 전각)"""
     if pd.isna(val): return ""
-    # 1. 문자열화 및 유니코드 정규화(전각->반각)
     s = str(val).strip()
     s = unicodedata.normalize('NFKC', s)
-    # 2. 제어 문자 및 모든 종류의 공백 제거
     s = re.sub(r'[\x00-\x1f\x7f-\x9f\s]', '', s)
-    # 3. 엑셀 숫자 흔적(.0) 제거 및 대문자화
     if s.endswith('.0'): s = s[:-2]
     return s.upper()
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (정밀 진단 모드)")
+st.title("⏱️ AS TAT 분석 시스템 (최종 정밀 진단)")
 
 # --- 2. 사이드바: 관리 및 강력 보정 ---
 with st.sidebar:
@@ -43,10 +40,15 @@ with st.sidebar:
         for _, row in m_df.iterrows():
             mat_no = ultimate_clean(row.iloc[0])
             if not mat_no: continue
+            
+            # 마스터의 업체명이나 분류가 비어있으면 매칭이 안 된 것처럼 보일 수 있음
+            v_name = str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) and str(row.iloc[5]).strip() != "" else "공급사명누락"
+            g_type = str(row.iloc[10]).strip() if not pd.isna(row.iloc[10]) and str(row.iloc[10]).strip() != "" else "분류구분누락"
+            
             m_data.append({
                 "자재번호": mat_no,
-                "공급업체명": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "정보없음",
-                "분류구분": str(row.iloc[10]).strip() if not pd.isna(row.iloc[10]) else "정보없음"
+                "공급업체명": v_name,
+                "분류구분": g_type
             })
         if m_data:
             supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
@@ -57,7 +59,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("2. 정보 보정")
-    if st.button("🔥 미등록 최종 교정 및 매칭", use_container_width=True):
+    if st.button("🔥 미등록 정밀 재매칭", use_container_width=True):
         with st.spinner("최종 정밀 대조 중..."):
             m_res = supabase.table("master_data").select("*").execute()
             m_lookup = {r['자재번호']: r for r in m_res.data}
@@ -76,20 +78,19 @@ with st.sidebar:
                 
                 supabase.table("as_history").update(payload).eq("id", row['id']).execute()
             
-            st.success(f"✅ {up_cnt}건 매칭 성공! (미등록 현황을 확인하세요)")
+            st.success(f"✅ {up_cnt}건 매칭 성공!")
             st.rerun()
 
     st.divider()
     st.subheader("3. 초기화")
-    if st.button("⚠️ 전체 삭제", type="primary", use_container_width=True):
-        if st.checkbox("데이터 삭제 확약"):
+    if st.button("⚠️ 데이터 전체 삭제", type="primary", use_container_width=True):
+        if st.checkbox("전체 삭제 동의"):
             supabase.table("as_history").delete().neq("id", -1).execute()
             supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
             st.rerun()
 
 # --- 3. 입고/출고 처리 ---
 tab1, tab2 = st.tabs(["📥 AS 입고", "📤 AS 출고"])
-
 with tab1:
     in_file = st.file_uploader("입고 엑셀", type=['xlsx'], key="in")
     if in_file and st.button("입고 처리 실행"):
@@ -133,11 +134,11 @@ try:
     res = supabase.table("as_history").select("*").order("입고일", desc=True).execute()
     data = pd.DataFrame(res.data)
     if not data.empty:
-        st.subheader("📊 현황 리포트")
+        st.subheader("📊 실시간 리포트")
         c1, c2, c3 = st.columns(3)
-        v_f = c1.multiselect("공급업체", sorted(data['공급업체명'].unique()))
-        g_f = c2.multiselect("분류구분", sorted(data['분류구분'].unique()))
-        s_f = c3.multiselect("상태", sorted(data['상태'].unique()))
+        v_f = c1.multiselect("🏢 공급업체 필터", sorted(data['공급업체명'].unique()))
+        g_f = c2.multiselect("📂 분류구분 필터", sorted(data['분류구분'].unique()))
+        s_f = c3.multiselect("🚚 상태 필터", sorted(data['상태'].unique()))
         
         dff = data.copy()
         if v_f: dff = dff[dff['공급업체명'].isin(v_f)]
@@ -152,7 +153,7 @@ try:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             dff.to_excel(writer, index=False)
-        st.download_button("📥 결과 다운로드", buffer.getvalue(), "AS_Analysis.xlsx")
+        st.download_button("📥 엑셀 결과 다운로드", buffer.getvalue(), "AS_Analysis.xlsx")
 
         st.dataframe(dff, use_container_width=True, hide_index=True)
 except: pass
