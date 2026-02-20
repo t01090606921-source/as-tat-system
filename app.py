@@ -9,18 +9,20 @@ url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-def final_clean(val):
-    """품목코드 원형 유지: 앞뒤 공백만 제거하고 대문자로 통일"""
+def raw_clean(val):
+    """데이터 왜곡 방지: 형변환 없이 문자열로 강제 고정 후 공백만 제거"""
     if pd.isna(val): return ""
-    # 숫자로 읽히는 경우를 대비해 소수점 제거 후 문자열화
+    # 어떤 형태든 문자열로 변환
     s = str(val).strip()
-    if s.endswith('.0'): s = s[:-2]
+    # 엑셀 특유의 .0 접미사만 제거 (숫자로 읽혔을 경우 대비)
+    if s.endswith('.0'):
+        s = s[:-2]
     return s.upper()
 
 st.set_page_config(page_title="AS TAT 분석 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (최종 보정본)")
+st.title("⏱️ AS TAT 분석 시스템 (데이터 보존 모드)")
 
-# --- 2. 사이드바: 설정 ---
+# --- 2. 사이드바: 설정 및 정밀 재매칭 ---
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     
@@ -28,16 +30,17 @@ with st.sidebar:
     master_file = st.file_uploader("마스터 업로드 (엑셀)", type=['xlsx'])
     if master_file and st.button("🚀 마스터 DB 갱신", use_container_width=True):
         try:
-            m_df = pd.read_excel(master_file)
+            # 모든 열을 '문자열'로 읽어오도록 지정 (dtype=str)
+            m_df = pd.read_excel(master_file, dtype=str)
             m_data = []
             for _, row in m_df.iterrows():
-                # 품목코드: A열(0), 업체명: F열(5), 분류: K열(10)
-                mat_no = final_clean(row.iloc[0]) 
+                # A(0): 품목코드, F(5): 공급업체, K(10): 분류구분
+                mat_no = raw_clean(row.iloc[0])
                 if not mat_no: continue
                 m_data.append({
                     "자재번호": mat_no,
-                    "공급업체명": str(row.iloc[5]).strip(),
-                    "분류구분": str(row.iloc[10]).strip()
+                    "공급업체명": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "미등록",
+                    "분류구분": str(row.iloc[10]).strip() if not pd.isna(row.iloc[10]) else "미등록"
                 })
             if m_data:
                 supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
@@ -45,31 +48,34 @@ with st.sidebar:
                     supabase.table("master_data").insert(m_data[i:i+500]).execute()
                 st.success(f"✅ 마스터 {len(m_data)}건 동기화 완료!")
         except Exception as e:
-            st.error(f"마스터 열 위치를 확인해주세요(A, F, K열): {e}")
+            st.error(f"마스터 로드 오류: {e}")
 
     st.divider()
-    st.subheader("2. 정보 보정")
-    if st.button("🔄 미등록 정보 재매칭", use_container_width=True):
-        with st.spinner("마스터 대조 중..."):
+    st.subheader("2. 정보 보정 (1:1 문자열 대조)")
+    if st.button("🔄 미등록 정보 정밀 재매칭", use_container_width=True):
+        with st.spinner("마스터와 1:1 대조 중..."):
             m_res = supabase.table("master_data").select("*").execute()
             m_lookup = {r['자재번호']: r for r in m_res.data}
+            
             h_res = supabase.table("as_history").select("id, 자재번호").execute()
             up_cnt = 0
             for row in h_res.data:
-                m_info = m_lookup.get(final_clean(row['자재번호']))
+                # DB에 저장된 번호를 다시 정제하여 마스터와 대조
+                clean_key = raw_clean(row['자재번호'])
+                m_info = m_lookup.get(clean_key)
                 if m_info:
                     supabase.table("as_history").update({
-                        "공급업체명": m_info['공급업체명'], "분류구분": m_info['분류구분']
+                        "공급업체명": m_info['공급업체명'], 
+                        "분류구분": m_info['분류구분']
                     }).eq("id", row['id']).execute()
                     up_cnt += 1
-            st.success(f"✅ {up_cnt}건 보정 성공!")
+            st.success(f"✅ {up_cnt}건 매칭 성공!")
             st.rerun()
 
     st.divider()
-    st.subheader("3. 초기화")
-    confirm = st.checkbox("전체 삭제 동의")
-    if st.button("⚠️ 전체 초기화", type="primary"):
-        if confirm:
+    st.subheader("3. 시스템 초기화")
+    if st.button("⚠️ 전체 삭제", type="primary"):
+        if st.checkbox("데이터 삭제 확약"):
             supabase.table("as_history").delete().neq("id", -1).execute()
             supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
             st.rerun()
@@ -80,20 +86,22 @@ tab1, tab2 = st.tabs(["📥 AS 입고", "📤 AS 출고"])
 with tab1:
     in_file = st.file_uploader("입고 엑셀", type=['xlsx'], key="in_up")
     if in_file and st.button("입고 처리 실행"):
-        df = pd.read_excel(in_file)
-        # 입고 파일은 D열(3번)이 품목코드, H열(7번)이 압축코드
-        as_in = df[df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
+        # 모든 데이터를 문자열로 로드하여 'R' 탈락 방지
+        df = pd.read_excel(in_file, dtype=str)
+        as_in = df[df.iloc[:, 0].str.contains('A/S 철거', na=False)].copy()
+        
         m_res = supabase.table("master_data").select("*").execute()
         m_lookup = {r['자재번호']: r for r in m_res.data}
         
         new_recs = []
         for _, row in as_in.iterrows():
-            mat_no = final_clean(row.iloc[3])
+            # D(3): 품목코드, H(7): 압축코드, F(5): 규격
+            mat_no = raw_clean(row.iloc[3])
             m_info = m_lookup.get(mat_no)
             new_recs.append({
                 "압축코드": str(row.iloc[7]).strip(), 
                 "자재번호": mat_no,
-                "규격": str(row.iloc[5]).strip(),
+                "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
                 "공급업체명": m_info['공급업체명'] if m_info else "미등록",
                 "분류구분": m_info['분류구분'] if m_info else "미등록",
                 "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d'),
@@ -102,15 +110,15 @@ with tab1:
         if new_recs:
             for i in range(0, len(new_recs), 500):
                 supabase.table("as_history").insert(new_recs[i:i+500]).execute()
-            st.success("✅ 입고 등록 완료")
+            st.success("✅ 입고 완료")
             st.rerun()
 
 with tab2:
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
-    if out_file and st.button("출고 매칭 실행"):
-        df = pd.read_excel(out_file)
-        # 출고 파일은 K열(10번)이 압축코드
-        as_out = df[df.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
+    if out_file and st.button("출고 매칭"):
+        df = pd.read_excel(out_file, dtype=str)
+        # D(3): AS 카톤 박스, K(10): 압축코드, G(6): 출고일
+        as_out = df[df.iloc[:, 3].str.contains('AS 카톤 박스', na=False)].copy()
         for _, row in as_out.iterrows():
             key = str(row.iloc[10]).strip()
             out_date = pd.to_datetime(row.iloc[6])
@@ -146,12 +154,12 @@ try:
         fin = dff[dff['상태'] == '출고 완료']
         m2.metric("평균 TAT", f"{round(pd.to_numeric(fin['tat']).mean(), 1) if not fin.empty else 0} 일")
         m3.metric("미등록 건수", f"{len(dff[dff['공급업체명'] == '미등록']):,} 건")
-        m4.metric("출고 대기", f"{len(dff[dff['상태'] == '출고 대기']):,} 건")
+        m4.metric("현재 대기", f"{len(dff[dff['상태'] == '출고 대기']):,} 건")
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             dff.to_excel(writer, index=False)
-        st.download_button("📥 엑셀 다운로드", output.getvalue(), f"AS_Report_{datetime.now().strftime('%m%d')}.xlsx")
+        st.download_button("📥 리포트 다운로드", output.getvalue(), f"AS_Report.xlsx")
 
         st.dataframe(dff, use_container_width=True, hide_index=True)
 except:
