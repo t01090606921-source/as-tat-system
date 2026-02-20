@@ -4,23 +4,27 @@ from supabase import create_client, Client
 from datetime import datetime
 import io
 import unicodedata
+import re
 
 # --- 1. Supabase 접속 설정 ---
 url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-def super_clean(val):
-    """자재번호의 모든 노이즈 제거 (전각/반각, 공백, 대문자)"""
+def ultimate_clean(val):
+    """자재번호의 모든 잠재적 불일치 요소 제거"""
     if pd.isna(val): return ""
+    # 1. 문자열화 및 유니코드 정규화(전각->반각)
     s = str(val).strip()
-    s = unicodedata.normalize('NFKC', s) # 전각/반각 통일
-    s = "".join(s.split()).upper()      # 모든 공백 제거 및 대문자화
-    if s.endswith('.0'): s = s[:-2]     # 엑셀 숫자 흔적 제거
-    return s
+    s = unicodedata.normalize('NFKC', s)
+    # 2. 제어 문자 및 모든 종류의 공백 제거
+    s = re.sub(r'[\x00-\x1f\x7f-\x9f\s]', '', s)
+    # 3. 엑셀 숫자 흔적(.0) 제거 및 대문자화
+    if s.endswith('.0'): s = s[:-2]
+    return s.upper()
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (데이터 강제 교정 모드)")
+st.title("⏱️ AS TAT 분석 시스템 (정밀 진단 모드)")
 
 # --- 2. 사이드바: 관리 및 강력 보정 ---
 with st.sidebar:
@@ -37,7 +41,7 @@ with st.sidebar:
         m_df = pd.read_excel(master_file, dtype=str)
         m_data = []
         for _, row in m_df.iterrows():
-            mat_no = super_clean(row.iloc[0])
+            mat_no = ultimate_clean(row.iloc[0])
             if not mat_no: continue
             m_data.append({
                 "자재번호": mat_no,
@@ -52,39 +56,33 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.subheader("2. 강력 정보 보정")
-    # 단순 매칭이 아니라 DB에 저장된 자재번호 자체를 다시 클리닝하여 업데이트함
-    if st.button("🔥 미등록 강제 교정 및 재매칭", use_container_width=True):
-        with st.spinner("DB 데이터 세척 및 대조 중..."):
-            # 1. 마스터 로드
+    st.subheader("2. 정보 보정")
+    if st.button("🔥 미등록 최종 교정 및 매칭", use_container_width=True):
+        with st.spinner("최종 정밀 대조 중..."):
             m_res = supabase.table("master_data").select("*").execute()
             m_lookup = {r['자재번호']: r for r in m_res.data}
             
-            # 2. 히스토리 로드
             h_res = supabase.table("as_history").select("id, 자재번호").execute()
             up_cnt = 0
-            
             for row in h_res.data:
-                # DB에 저장된 자재번호를 다시 한번 super_clean 처리
-                cleaned_val = super_clean(row['자재번호'])
+                cleaned_val = ultimate_clean(row['자재번호'])
                 m_info = m_lookup.get(cleaned_val)
                 
-                # 업데이트 데이터 준비 (자재번호 자체도 깨끗하게 교정)
-                update_payload = {"자재번호": cleaned_val}
+                payload = {"자재번호": cleaned_val}
                 if m_info:
-                    update_payload["공급업체명"] = m_info['공급업체명']
-                    update_payload["분류구분"] = m_info['분류구분']
+                    payload["공급업체명"] = m_info['공급업체명']
+                    payload["분류구분"] = m_info['분류구분']
+                    up_cnt += 1
                 
-                supabase.table("as_history").update(update_payload).eq("id", row['id']).execute()
-                if m_info: up_cnt += 1
-                
-            st.success(f"✅ {up_cnt}건 매칭 성공 및 DB 교정 완료!")
+                supabase.table("as_history").update(payload).eq("id", row['id']).execute()
+            
+            st.success(f"✅ {up_cnt}건 매칭 성공! (미등록 현황을 확인하세요)")
             st.rerun()
 
     st.divider()
     st.subheader("3. 초기화")
-    if st.button("⚠️ 시스템 전체 초기화", type="primary", use_container_width=True):
-        if st.checkbox("정말 삭제하시겠습니까?"):
+    if st.button("⚠️ 전체 삭제", type="primary", use_container_width=True):
+        if st.checkbox("데이터 삭제 확약"):
             supabase.table("as_history").delete().neq("id", -1).execute()
             supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
             st.rerun()
@@ -101,7 +99,7 @@ with tab1:
         m_lookup = {r['자재번호']: r for r in m_res.data}
         recs = []
         for _, row in as_in.iterrows():
-            mat = super_clean(row.iloc[3])
+            mat = ultimate_clean(row.iloc[3])
             m = m_lookup.get(mat)
             recs.append({
                 "압축코드": str(row.iloc[7]).strip(), "자재번호": mat,
@@ -113,7 +111,6 @@ with tab1:
         if recs:
             for i in range(0, len(recs), 200):
                 supabase.table("as_history").insert(recs[i:i+200]).execute()
-            st.success("입고 완료")
             st.rerun()
 
 with tab2:
@@ -128,10 +125,9 @@ with tab2:
                 in_dt = pd.to_datetime(target.data[0]['입고일'])
                 tat = round((date - in_dt).total_seconds() / 86400, 2)
                 supabase.table("as_history").update({"출고일": date.strftime('%Y-%m-%d'), "tat": tat, "상태": "출고 완료"}).eq("id", target.data[0]['id']).execute()
-        st.success("출고 완료")
         st.rerun()
 
-# --- 4. 리포트 & 필터 & 다운로드 ---
+# --- 4. 리포트 & 필터 ---
 st.divider()
 try:
     res = supabase.table("as_history").select("*").order("입고일", desc=True).execute()
@@ -153,11 +149,10 @@ try:
         m2.metric("미등록 건수", f"{len(dff[dff['공급업체명'] == '미등록'])} 건")
         m3.metric("평균 TAT", f"{round(pd.to_numeric(dff['tat']).mean(), 1) if 'tat' in dff else 0} 일")
 
-        # 엑셀 다운로드
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             dff.to_excel(writer, index=False)
-        st.download_button("📥 리포트 다운로드", buffer.getvalue(), "AS_Report.xlsx")
+        st.download_button("📥 결과 다운로드", buffer.getvalue(), "AS_Analysis.xlsx")
 
         st.dataframe(dff, use_container_width=True, hide_index=True)
 except: pass
