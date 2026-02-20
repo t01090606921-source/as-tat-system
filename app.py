@@ -8,8 +8,8 @@ url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-st.set_page_config(page_title="AS TAT 분석 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (78건 최종 소거 모드)")
+st.set_page_config(page_title="AS TAT 시스템", layout="wide")
+st.title("⏱️ AS TAT 분석 시스템 (포함 매칭 모드)")
 
 # --- 2. 사이드바: 관리 기능 ---
 with st.sidebar:
@@ -23,59 +23,58 @@ with st.sidebar:
     st.subheader("1. 마스터 관리")
     master_file = st.file_uploader("마스터 엑셀 업로드", type=['xlsx'])
     if master_file and st.button("🚀 마스터 강제 재등록", use_container_width=True):
-        # [중요] engine='openpyxl'을 명시하고 모든 값을 object(문자열)로 강제 로드
-        m_df = pd.read_excel(master_file, dtype=str, engine='openpyxl')
-        
-        # '품목코드' 또는 '자재번호' 열 정확히 찾기
-        target_col = ""
-        for col in m_df.columns:
-            if "품목코드" in str(col) or "자재번호" in str(col):
-                target_col = col
-                break
+        m_df = pd.read_excel(master_file, dtype=str)
+        target_col = next((col for col in m_df.columns if "품목코드" in str(col) or "자재번호" in str(col)), None)
         
         if target_col:
             m_data = []
             for _, row in m_df.iterrows():
-                # 어떠한 가공도 없이 문자열 그대로 추출
-                mat_val = str(row[target_col]).strip()
-                if not mat_val or mat_val == "nan": continue
-                
+                mat_val = str(row[target_col]).strip().upper()
+                if not mat_val or mat_val == "NAN": continue
                 m_data.append({
                     "자재번호": mat_val,
                     "공급업체명": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "정보없음",
                     "분류구분": str(row.iloc[10]).strip() if not pd.isna(row.iloc[10]) else "정보없음"
                 })
-            
             if m_data:
-                # 데이터가 확실히 있으므로 안전하게 삭제 후 입력
                 supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
-                # 100건씩 안전 분할 업로드
                 for i in range(0, len(m_data), 100):
                     supabase.table("master_data").insert(m_data[i:i+100]).execute()
-                st.success(f"✅ {len(m_data)}건 마스터가 원본 그대로 등록되었습니다.")
+                st.success("✅ 마스터 원본 등록 완료")
                 st.rerun()
 
     st.divider()
-    if st.button("🔥 남은 78건 끝장 재매칭", use_container_width=True):
-        with st.spinner("최종 대조 중..."):
+    st.subheader("2. 미등록 202건 해결")
+    if st.button("🔥 유연한 포함 매칭 실행", use_container_width=True):
+        with st.spinner("모든 가능성을 열고 재매칭 중..."):
             m_res = supabase.table("master_data").select("*").execute()
-            # 딕셔너리 생성 시 문자열 일치 극대화
-            m_lookup = {str(r['자재번호']): r for r in m_res.data}
+            master_list = m_res.data # 리스트로 보관
             
-            h_res = supabase.table("as_history").select("id, 자재번호").execute()
+            h_res = supabase.table("as_history").select("id, 자재번호").eq("공급업체명", "미등록").execute()
+            
             up_cnt = 0
             for row in h_res.data:
-                mat_val = str(row['자재번호']).strip()
-                if mat_val in m_lookup:
+                h_val = str(row['자재번호']).strip().upper()
+                
+                # [핵심 로직] 1:1 매칭이 안되면 포함 관계로 검색
+                match_info = None
+                for m_item in master_list:
+                    m_val = str(m_item['자재번호']).strip().upper()
+                    
+                    if h_val == m_val or h_val in m_val or m_val in h_val:
+                        match_info = m_item
+                        break
+                
+                if match_info:
                     supabase.table("as_history").update({
-                        "공급업체명": m_lookup[mat_val]['공급업체명'], 
-                        "분류구분": m_lookup[mat_val]['분류구분']
+                        "공급업체명": match_info['공급업체명'], 
+                        "분류구분": match_info['분류구분']
                     }).eq("id", row['id']).execute()
                     up_cnt += 1
-            st.success(f"✅ {up_cnt}건 매칭 완료!")
+            st.success(f"✅ {up_cnt}건의 미등록 데이터가 성공적으로 보정되었습니다!")
             st.rerun()
 
-# --- 3. 입고/출고 로직 (변동 없음) ---
+# --- 3. 입고/출고 (생략 없이 유지) ---
 tab1, tab2 = st.tabs(["📥 AS 입고", "📤 AS 출고"])
 with tab1:
     in_file = st.file_uploader("입고 엑셀", type=['xlsx'], key="in")
@@ -85,7 +84,7 @@ with tab1:
         recs = []
         for _, row in as_in.iterrows():
             recs.append({
-                "압축코드": str(row.iloc[7]).strip(), "자재번호": str(row.iloc[3]).strip(),
+                "압축코드": str(row.iloc[7]).strip(), "자재번호": str(row.iloc[3]).strip().upper(),
                 "규격": str(row.iloc[5]).strip(), "상태": "출고 대기",
                 "공급업체명": "미등록", "분류구분": "미등록",
                 "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
@@ -113,18 +112,8 @@ st.divider()
 try:
     res = supabase.table("as_history").select("*").order("입고일", desc=True).execute()
     if res.data:
-        data = pd.DataFrame(res.data)
+        dff = pd.DataFrame(res.data)
         st.subheader("📊 현황 리포트")
-        # 필터 3종
-        c1, c2, c3 = st.columns(3)
-        v_f = c1.multiselect("🏢 공급업체", sorted(data['공급업체명'].unique()))
-        g_f = c2.multiselect("📂 분류구분", sorted(data['분류구분'].unique()))
-        s_f = c3.multiselect("🚚 상태", sorted(data['상태'].unique()))
-        
-        dff = data.copy()
-        if v_f: dff = dff[dff['공급업체명'].isin(v_f)]
-        if g_f: dff = dff[dff['분류구분'].isin(g_f)]
-        if s_f: dff = dff[dff['상태'].isin(s_f)]
         
         m1, m2 = st.columns(2)
         m1.metric("총 건수", f"{len(dff)} 건")
