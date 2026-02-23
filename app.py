@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import io
+import time
 
 # --- 1. Supabase 접속 설정 ---
 url: str = st.secrets["SUPABASE_URL"]
@@ -9,7 +10,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("⏱️ AS TAT 분석 시스템 (VLOOKUP 동기화 모드)")
+st.title("⏱️ AS TAT 분석 시스템 (실시간 정밀 보정)")
 
 # --- 2. 사이드바: 관리 및 초기화 ---
 with st.sidebar:
@@ -22,7 +23,7 @@ with st.sidebar:
 
     st.subheader("1. 마스터 갱신")
     master_file = st.file_uploader("마스터 엑셀", type=['xlsx'])
-    if master_file and st.button("🚀 마스터 강제 재등록"):
+    if master_file and st.button("🚀 마스터 강제 재등록", use_container_width=True):
         m_df = pd.read_excel(master_file, dtype=str)
         t_col = next((c for c in m_df.columns if "품목코드" in str(c) or "자재번호" in str(c)), m_df.columns[0])
         m_data = [{"자재번호": str(row[t_col]).strip(), 
@@ -38,27 +39,40 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    # 🔥 초기화 및 보정 버튼
-    if st.button("🔥 미등록 201건 강제 보정(VLOOKUP 방식)", type="primary", use_container_width=True):
-        with st.spinner("DB 전수 대조 중..."):
-            # 1. 마스터 전체 로드
-            m_res = supabase.table("master_data").select("*").execute()
-            m_lookup = {str(r['자재번호']).strip(): r for r in m_res.data}
-            
-            # 2. 미등록 상태인 히스토리만 로드
-            h_res = supabase.table("as_history").select("id, 자재번호").eq("공급업체명", "미등록").execute()
-            
+    st.subheader("2. 미등록 183건 정밀 추적")
+    if st.button("🔥 실시간 정밀 보정 시작", type="primary", use_container_width=True):
+        # 1. 마스터 전체 로드
+        m_res = supabase.table("master_data").select("*").execute()
+        m_lookup = {str(r['자재번호']).strip(): r for r in m_res.data}
+        
+        # 2. 미등록 상태인 히스토리만 로드
+        h_res = supabase.table("as_history").select("id, 자재번호").eq("공급업체명", "미등록").execute()
+        
+        if not h_res.data:
+            st.info("보정할 미등록 데이터가 없습니다.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             success_cnt = 0
-            for row in h_res.data:
+            total = len(h_res.data)
+            
+            for i, row in enumerate(h_res.data):
                 target_val = str(row['자재번호']).strip()
                 if target_val in m_lookup:
-                    # 일치할 경우 업데이트
+                    # 건별로 확실하게 업데이트
                     supabase.table("as_history").update({
                         "공급업체명": m_lookup[target_val]['공급업체명'],
                         "분류구분": m_lookup[target_val]['분류구분']
                     }).eq("id", row['id']).execute()
                     success_cnt += 1
-            st.success(f"✅ {success_cnt}건 보정 완료!")
+                
+                # 진행률 표시
+                prog = (i + 1) / total
+                progress_bar.progress(prog)
+                status_text.text(f"진행 중: {i+1}/{total} (성공: {success_cnt})")
+                
+            st.success(f"✅ 보정 완료! 총 {success_cnt}건의 정보가 업데이트되었습니다.")
+            time.sleep(1)
             st.rerun()
 
     if st.button("⚠️ 데이터 전체 삭제", use_container_width=True):
@@ -73,7 +87,6 @@ with tab1:
         df = pd.read_excel(in_file, dtype=str)
         as_in = df[df.iloc[:, 0].str.contains('A/S 철거', na=False)].copy()
         
-        # 입고 시점에는 일단 넣고, 사이드바 버튼으로 보정하는 구조로 변경 (안전성)
         recs = []
         for _, row in as_in.iterrows():
             recs.append({
@@ -85,7 +98,7 @@ with tab1:
         if recs:
             for i in range(0, len(recs), 200):
                 supabase.table("as_history").insert(recs[i:i+200]).execute()
-            st.success("데이터가 입력되었습니다. 사이드바의 '강제 보정'을 눌러주세요.")
+            st.success("데이터가 입력되었습니다. 사이드바의 '정밀 보정'을 눌러주세요.")
             st.rerun()
 
 with tab2:
@@ -108,6 +121,7 @@ if res.data:
     df_res = pd.DataFrame(res.data)
     st.subheader("📊 현황 리포트")
     
+    # 필터
     c1, c2, c3 = st.columns(3)
     v_f = c1.multiselect("🏢 공급업체 필터", sorted(df_res['공급업체명'].unique()))
     g_f = c2.multiselect("📂 분류구분 필터", sorted(df_res['분류구분'].unique()))
