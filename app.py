@@ -10,7 +10,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (출고 일자 정밀 보정)")
+st.title("📊 AS TAT 통합 관리 (재입고 필터링 버전)")
 
 def sanitize_code(val):
     if pd.isna(val): return ""
@@ -41,7 +41,6 @@ with tab1:
 
     if m_file and i_file and st.button("🚀 매칭 및 입고 시작"):
         prog_bar = st.progress(0)
-        # (중략: 이전과 동일한 고속 입고 로직)
         m_df = pd.read_excel(m_file, dtype=str)
         m_lookup = {sanitize_code(row.iloc[0]): {"공급업체명": str(row.iloc[5]).strip(), "분류구분": str(row.iloc[10]).strip()} for _, row in m_df.iterrows() if sanitize_code(row.iloc[0])}
         
@@ -54,9 +53,12 @@ with tab1:
             m_info = m_lookup.get(cur_mat)
             recs.append({
                 "압축코드": str(row.iloc[7]).strip() if not pd.isna(row.iloc[7]) else "",
-                "자재번호": cur_mat, "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
-                "상태": "출고 대기", "공급업체명": m_info['공급업체명'] if m_info else "미등록",
-                "분류구분": m_info['분류구분'] if m_info else "미등록", "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                "자재번호": cur_mat, 
+                "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
+                "상태": "출고 대기", 
+                "공급업체명": m_info['공급업체명'] if m_info else "미등록",
+                "분류구분": m_info['분류구분'] if m_info else "미등록", 
+                "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
             })
             if len(recs) >= 200:
                 supabase.table("as_history").insert(recs).execute()
@@ -66,48 +68,32 @@ with tab1:
         st.success("입고 완료")
 
 with tab2:
-    st.info("💡 출고 엑셀의 각 행에 적힌 날짜를 압축코드별로 각각 매칭하여 업데이트합니다.")
+    st.info("💡 출고 엑셀의 날짜를 개별 매칭합니다.")
     out_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_up")
     
     if out_file and st.button("🚀 개별 출고 업데이트 시작"):
         df_out = pd.read_excel(out_file, dtype=str)
-        # 'AS 카톤 박스'가 포함된 행만 필터링 (D열 = index 3)
         as_out = df_out[df_out.iloc[:, 3].fillna('').str.contains('AS 카톤 박스', na=False)].copy()
         
         if not as_out.empty:
-            total_out = len(as_out)
-            out_prog = st.progress(0)
-            status_txt = st.empty()
-            
-            # 성능을 위해 50건씩 묶어서 날짜별 업데이트
-            # 동일한 날짜를 가진 압축코드끼리 그룹화하여 처리
             as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
-            as_out['clean_code'] = as_out.iloc[:, 10].str.strip() # K열 압축코드
-            
-            # 날짜별로 그룹화하여 DB 업데이트 횟수 최소화
+            as_out['clean_code'] = as_out.iloc[:, 10].str.strip()
             date_groups = as_out.groupby('clean_date')['clean_code'].apply(list).to_dict()
             
+            total_out = len(as_out)
+            out_prog = st.progress(0)
             processed_count = 0
+            
             for out_date, codes in date_groups.items():
-                # 한 번에 너무 많은 코드를 업데이트하면 오류가 날 수 있으므로 200개씩 분할
                 for j in range(0, len(codes), 200):
                     batch_codes = codes[j:j+200]
-                    supabase.table("as_history").update({
-                        "출고일": out_date, 
-                        "상태": "출고 완료"
-                    }).in_("압축코드", batch_codes).execute()
-                    
+                    supabase.table("as_history").update({"출고일": out_date, "상태": "출고 완료"}).in_("압축코드", batch_codes).execute()
                     processed_count += len(batch_codes)
-                    ratio = processed_count / total_out
-                    out_prog.progress(ratio)
-                    status_txt.info(f"🚚 날짜별 매칭 중: {out_date}자 데이터 처리 중... ({processed_count}/{total_out})")
-            
-            st.success(f"✅ 총 {total_out:,}건의 출고 일자가 개별적으로 업데이트되었습니다.")
-        else:
-            st.error("출고 대상('AS 카톤 박스') 데이터가 없습니다.")
+                    out_prog.progress(processed_count / total_out)
+            st.success(f"✅ 총 {total_out:,}건 출고 업데이트 완료")
 
 with tab3:
-    if st.button("📊 TAT 분석 리포트 생성"):
+    if st.button("📈 분석 리포트 생성"):
         df_raw_list = []
         last_id = -1
         load_msg = st.empty()
@@ -116,25 +102,42 @@ with tab3:
             if not res.data: break
             df_raw_list.extend(res.data)
             last_id = res.data[-1]['id']
-            load_msg.info(f"📥 리포트 데이터 수집 중... ({len(df_raw_list):,}건)")
+            load_msg.info(f"📥 데이터 수집 중... ({len(df_raw_list):,}건)")
         
         if df_raw_list:
             df_final = pd.DataFrame(df_raw_list)
-            # 분류구분에 '수리대상'이 포함되고, 출고일이 있는 데이터만 필터링
+            df_final['입고일'] = pd.to_datetime(df_final['입고일'])
+            df_final['출고일'] = pd.to_datetime(df_final['출고일'])
+            
+            # [핵심 로직] 재입고 건 처리: 입고일이 출고일보다 늦으면 출고일을 무효화(NaT)
+            # NaT는 엑셀 출력 시 빈칸으로 표시됩니다.
+            df_final.loc[df_final['입고일'] > df_final['출고일'], '출고일'] = pd.NaT
+            
+            # 분석 대상 필터링: 분류구분이 '수리대상'이고, 유효한 출고일이 있는 데이터만
             df_rep = df_final[
                 (df_final['분류구분'].str.contains('수리대상', na=False)) & 
                 (df_final['출고일'].notna())
             ].copy()
             
+            # TAT 계산 (재입고 건은 위에서 필터링되었으므로 정상 건만 계산됨)
+            df_rep['TAT'] = (df_rep['출고일'] - df_rep['입고일']).dt.days
+            
+            # 전체 통계 표시
+            col1, col2, col3 = st.columns(3)
+            col1.metric("총 수리대상", f"{len(df_final[df_final['분류구분'].str.contains('수리대상', na=False)]):,}건")
+            col2.metric("출고 완료(TAT 분석)", f"{len(df_rep):,}건")
+            col3.metric("재입고/미출고 제외", f"{len(df_final[(df_final['분류구분'].str.contains('수리대상', na=False)) & (df_final['출고일'].isna())]):,}건")
+
             if not df_rep.empty:
-                df_rep['입고일'] = pd.to_datetime(df_rep['입고일'])
-                df_rep['출고일'] = pd.to_datetime(df_rep['출고일'])
-                df_rep['TAT'] = (df_rep['출고일'] - df_rep['입고일']).dt.days
-                
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df_rep[['입고일', '출고일', '자재번호', '규격', '공급업체명', '압축코드', 'TAT']].to_excel(writer, index=False)
+                    # 입고일/출고일을 보기 좋게 포맷팅하여 저장
+                    df_out_xlsx = df_rep.copy()
+                    df_out_xlsx['입고일'] = df_out_xlsx['입고일'].dt.strftime('%Y-%m-%d')
+                    df_out_xlsx['출고일'] = df_out_xlsx['출고일'].dt.strftime('%Y-%m-%d')
+                    df_out_xlsx[['입고일', '출고일', '자재번호', '규격', '공급업체명', '압축코드', 'TAT']].to_excel(writer, index=False)
+                
                 st.download_button("📥 TAT 리포트 다운로드", output.getvalue(), "AS_TAT_Final_Report.xlsx")
-                st.write(df_rep[['입고일', '출고일', 'TAT']].head(20)) # 상위 20건 미리보기로 날짜 확인
+                st.dataframe(df_out_xlsx[['입고일', '출고일', '자재번호', 'TAT']].head(50))
             else:
-                st.warning("출고 완료된 '수리대상' 데이터가 없습니다.")
+                st.warning("분석 가능한 유효 출고 데이터가 없습니다.")
