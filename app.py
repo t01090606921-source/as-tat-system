@@ -10,32 +10,32 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (진행 바 강제 표시 버전)")
+st.title("📊 AS TAT 통합 관리 (마스터 로딩 최적화)")
 
-# [표준화 함수]
 def sanitize_code(val):
     if pd.isna(val): return ""
     return str(val).split('.')[0].strip().upper()
 
-# [데이터 로드 함수]
-def fetch_all_data(table_name, columns="*"):
+# [마스터 데이터 전용 고속 로드]
+@st.cache_data(ttl=600) # 10분간 메모리에 결과 저장 (속도 향상)
+def get_master_lookup():
     all_data = []
     last_id = -1
-    status_area = st.empty()
-    while True:
-        try:
-            res = supabase.table(table_name).select(columns).gt("id", last_id).order("id").limit(1000).execute()
+    limit = 1000
+    try:
+        while True:
+            res = supabase.table("master_data").select("*").gt("id", last_id).order("id").limit(limit).execute()
             if not res.data: break
             all_data.extend(res.data)
             last_id = res.data[-1]['id']
-            status_area.info(f"📥 DB 데이터 수집 중... ({len(all_data):,}건)")
-        except:
-            time.sleep(1)
-            continue
-    status_area.empty()
-    return pd.DataFrame(all_data)
+            if len(all_data) > 150000: break # 안전장치: 너무 많으면 중단
+    except Exception as e:
+        st.error(f"마스터 DB 연결 오류: {e}")
+        return {}
+    
+    return {str(r['자재번호']): r for r in all_data}
 
-# --- 2. 사이드바 (초기화 및 마스터) ---
+# --- 2. 사이드바 (초기화 및 마스터 등록) ---
 with st.sidebar:
     st.header("⚙️ 설정")
     if st.button("⚠️ 데이터 전체 초기화", type="primary", use_container_width=True):
@@ -45,7 +45,7 @@ with st.sidebar:
             if not res.data: break
             ids = [i['id'] for i in res.data]
             supabase.table("as_history").delete().in_("id", ids).execute()
-            msg.warning(f"🗑️ 삭제 중... (최근 ID: {ids[-1]})")
+            msg.warning(f"🗑️ 삭제 중... (ID: {ids[-1]})")
         st.success("초기화 완료")
         st.rerun()
 
@@ -66,6 +66,7 @@ with st.sidebar:
             supabase.table("master_data").delete().neq("자재번호", "EMPTY").execute()
             for i in range(0, len(m_list), 200):
                 supabase.table("master_data").insert(m_list[i:i+200]).execute()
+            st.cache_data.clear() # 캐시 삭제
             st.success("마스터 등록 성공")
 
 # --- 3. 메인 기능 ---
@@ -73,32 +74,27 @@ tab1, tab2, tab3 = st.tabs(["📥 AS 입고", "📤 AS 출고", "📊 분석 리
 
 with tab1:
     in_file = st.file_uploader("입고 엑셀 업로드", type=['xlsx'], key="in_main")
-    
-    # 입고 버튼 클릭 시 실행되는 영역
     if in_file and st.button("🚀 정밀 입고 실행"):
-        # 1. 화면에 진행 표시기 미리 생성 (강제 고정)
-        progress_info = st.empty()
-        progress_bar = st.progress(0)
+        step_msg = st.empty()
+        p_bar = st.progress(0)
         status_msg = st.empty()
+
+        # [단계 1] 마스터 데이터 로드 (캐시 활용)
+        step_msg.warning("⏳ 1단계: 마스터 데이터를 불러오는 중입니다...")
+        m_lookup = get_master_lookup()
         
-        progress_info.warning("⏳ 1단계: 마스터 데이터를 로드하고 있습니다...")
-        m_df_local = fetch_all_data("master_data")
-        m_lookup = {str(r['자재번호']): r for r in m_df_local.to_dict('records')}
-        
-        # 2. 엑셀 로딩 (성능 최적화 버전)
-        progress_info.warning("⏳ 2단계: 업로드하신 엑셀 파일을 분석 중입니다. (대용량의 경우 1분 이상 소요)")
-        try:
-            # openpyxl보다 빠른 엔진 시도
-            df = pd.read_excel(in_file, dtype=str)
-        except Exception as e:
-            st.error(f"엑셀을 읽는 중 에러가 발생했습니다: {e}")
+        if not m_lookup:
+            st.error("마스터 데이터를 불러오지 못했습니다. 사이드바에서 먼저 등록해주세요.")
             st.stop()
-            
+
+        # [단계 2] 엑셀 읽기
+        step_msg.warning("⏳ 2단계: 엑셀 파일을 분석 중입니다...")
+        df = pd.read_excel(in_file, dtype=str)
         as_in = df[df.iloc[:, 0].fillna('').str.contains('A/S 철거', na=False)].copy()
         total_rows = len(as_in)
         
         if total_rows > 0:
-            progress_info.info(f"✅ 3단계: 총 {total_rows:,}건의 입고 데이터를 처리합니다.")
+            step_msg.info(f"✅ 3단계: 총 {total_rows:,}건 입고 시작")
             
             recs = []
             for i, (_, row) in enumerate(as_in.iterrows()):
@@ -115,48 +111,18 @@ with tab1:
                     "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
                 })
                 
-                # 100건마다 DB 전송 및 진행 바 강제 갱신 (더 자주 갱신)
+                # 100건 단위 전송
                 if len(recs) >= 100:
-                    try:
-                        supabase.table("as_history").insert(recs).execute()
-                    except:
-                        time.sleep(1)
-                        supabase.table("as_history").insert(recs).execute()
-                    
+                    supabase.table("as_history").insert(recs).execute()
                     recs = []
-                    # 진행률 계산 및 표시
                     ratio = (i + 1) / total_rows
-                    progress_bar.progress(ratio)
-                    status_msg.markdown(f"### 🏃 현재 입고 중: {i+1:,} / {total_rows:,} 건 ({ratio*100:.1f}%)")
+                    p_bar.progress(ratio)
+                    status_msg.markdown(f"### 🏃 입고 중: {i+1:,} / {total_rows:,} 건")
             
-            # 남은 데이터 처리
             if recs:
                 supabase.table("as_history").insert(recs).execute()
-                progress_bar.progress(1.0)
+                p_bar.progress(1.0)
             
-            progress_info.success(f"🎊 모든 작업이 완료되었습니다! 총 {total_rows:,}건 입고 완료.")
-            status_msg.empty()
+            step_msg.success(f"🎊 총 {total_rows:,}건 입고 완료!")
         else:
-            st.error("입고 대상('A/S 철거') 데이터가 엑셀에 없습니다. 컬럼 위치나 텍스트를 확인해주세요.")
-
-with tab2:
-    # 출고 로직 (간략 버전)
-    out_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_main")
-    if out_file and st.button("🚀 출고 업데이트"):
-        df_out = pd.read_excel(out_file, dtype=str)
-        as_out = df_out[df_out.iloc[:, 3].fillna('').str.contains('AS 카톤 박스', na=False)].copy()
-        if not as_out.empty:
-            out_keys = as_out.iloc[:, 10].dropna().tolist()
-            out_date = pd.to_datetime(as_out.iloc[0, 6]).strftime('%Y-%m-%d')
-            out_bar = st.progress(0)
-            for i in range(0, len(out_keys), 500):
-                supabase.table("as_history").update({"출고일": out_date, "상태": "출고 완료"}).in_("압축코드", out_keys[i:i+500]).execute()
-                out_bar.progress(min((i+500)/len(out_keys), 1.0))
-            st.success("출고 처리 완료")
-
-with tab3:
-    if st.button("📈 분석 리포트 생성"):
-        df_raw = fetch_all_data("as_history")
-        if not df_raw.empty:
-            # 리포트 생성 로직... (이전과 동일)
-            st.write("리포트 생성 완료 (위의 데이터 합계 확인)")
+            st.error("입고 대상 데이터가 없습니다.")
