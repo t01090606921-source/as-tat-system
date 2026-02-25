@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (구조 최적화 버전)")
+st.title("📊 AS TAT 통합 관리 (CSV 고속 모드)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -26,49 +26,52 @@ with st.sidebar:
         st.rerun()
 
 # --- 3. 메인 탭 ---
-tab1, tab2, tab3 = st.tabs(["📥 고속 정밀 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
+tab1, tab2, tab3 = st.tabs(["📥 CSV 고속 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 파일 로딩이 멈춘다면 엑셀을 'CSV'로 저장하여 업로드하는 것이 가장 빠릅니다.")
+    st.info("💡 엑셀을 'CSV(쉼표로 분리)' 형식으로 저장한 후 업로드하세요. 로딩 속도가 압도적으로 빠릅니다.")
     col1, col2 = st.columns(2)
-    with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx'], key="m_up")
-    with col2: i_file = st.file_uploader("2. AS 입고 엑셀", type=['xlsx'], key="i_up")
+    with col1: m_file = st.file_uploader("1. 마스터 엑셀 (XLSX 권장)", type=['xlsx', 'csv'], key="m_up")
+    with col2: i_file = st.file_uploader("2. AS 입고 CSV 업로드", type=['csv'], key="i_up")
 
-    if m_file and i_file and st.button("🚀 입고 시작"):
+    if m_file and i_file and st.button("🚀 CSV 입고 시작"):
         status_text = st.empty()
         p_bar = st.progress(0)
         
         try:
             # [1] 마스터 로드
             status_text.info("🔍 마스터 분석 중...")
-            m_df = pd.read_excel(m_file).fillna("")
+            if m_file.name.endswith('.csv'):
+                m_df = pd.read_csv(m_file, encoding='cp949').fillna("")
+            else:
+                m_df = pd.read_excel(m_file).fillna("")
+                
             m_lookup = {sanitize_code(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip() if len(row) > 5 else "미등록",
                 "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
             } for _, row in m_df.iterrows()}
 
-            # [2] 입고 파일 로드 (오류 방지를 위해 usecols 제거 후 메모리에서 처리)
-            status_text.info("📄 입고 파일 읽는 중... (잠시만 기다려주세요)")
-            # 가장 범용적인 엔진으로 읽기 시도
-            i_df = pd.read_excel(i_file).fillna("")
+            # [2] 입고 CSV 로드 (인코딩 예외 처리)
+            status_text.info("📄 CSV 파일 읽는 중...")
+            try:
+                i_df = pd.read_csv(i_file, encoding='cp949').fillna("")
+            except:
+                i_df = pd.read_csv(i_file, encoding='utf-8-sig').fillna("")
             
             # [3] 필터링 및 변환
             status_text.info("⚙️ 데이터 매칭 및 필터링 중...")
-            # A열(0)에 'A/S 철거'가 포함된 행만 추출
             as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
             total = len(as_in)
             
             if total == 0:
-                st.error("❌ 'A/S 철거' 항목을 찾지 못했습니다. 엑셀의 첫 번째 열을 확인하세요.")
+                st.error("❌ 'A/S 철거' 항목을 찾지 못했습니다. CSV의 첫 번째 열을 확인하세요.")
             else:
                 recs = []
                 for i, (_, row) in enumerate(as_in.iterrows()):
-                    # 진행률 표시
                     if i % 100 == 0:
                         p_bar.progress(min((i + 1) / total, 1.0))
                         status_text.info(f"🚀 DB 저장 중... ({i+1:,} / {total:,}건)")
 
-                    # 안전한 인덱스 접근 (A=0, B=1, D=3, E=4, F=5, H=7)
                     cur_mat = sanitize_code(row.iloc[3])
                     m_info = m_lookup.get(cur_mat, {})
                     
@@ -94,13 +97,12 @@ with tab1:
                     supabase.table("as_history").insert(recs).execute()
                 
                 p_bar.progress(1.0)
-                status_text.success(f"🎊 완료! 총 {total:,}건 처리되었습니다.")
+                status_text.success(f"🎊 완료! CSV 기준 총 {total:,}건이 입고되었습니다.")
             
         except Exception as e:
-            st.error(f"❌ 오류 발생: {e}")
-            st.info("해결 팁: 엑셀 파일의 시트가 여러 개라면 첫 번째 시트에 데이터를 두세요.")
+            st.error(f"❌ CSV 오류 발생: {e}")
 
-# --- 출고 및 분석 탭 (동작 확인된 코드 유지) ---
+# --- 출고 및 분석 탭 (동일 로직 유지) ---
 with tab2:
     st.info("📤 출고 엑셀 업로드")
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
@@ -143,6 +145,6 @@ with tab3:
     if st.session_state.data_ready:
         st.divider()
         c1, c2, c3 = st.columns(3)
-        with c1: st.download_button("📥 완료", st.session_state.bin_tat, "1.xlsx")
-        with c2: st.download_button("📥 미출고", st.session_state.bin_stay, "2.xlsx")
-        with c3: st.download_button("📥 전체", st.session_state.bin_total, "3.xlsx")
+        with c1: st.download_button("📥 완료 리포트", st.session_state.bin_tat, "1.xlsx")
+        with c2: st.download_button("📥 미출고 명단", st.session_state.bin_stay, "2.xlsx")
+        with c3: st.download_button("📥 전체 리포트", st.session_state.bin_total, "3.xlsx")
