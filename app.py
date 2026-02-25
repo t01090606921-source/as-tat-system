@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (컬럼 이름 자동 매칭 버전)")
+st.title("📊 AS TAT 통합 관리 (명칭 최적화 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -31,104 +31,120 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 고속 정밀 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 엑셀의 제목줄(Header)을 기준으로 데이터를 찾습니다. 제목줄 위치를 확인하세요.")
+    st.info("💡 '입고일자'와 '자재번호' 등 제목줄 명칭을 자동으로 분석하여 업로드합니다.")
     col1, col2 = st.columns(2)
-    with col1: m_file = st.file_uploader("1. 마스터 엑셀 업로드", type=['xlsx'])
-    with col2: i_file = st.file_uploader("2. AS 입고 엑셀 업로드", type=['xlsx'])
+    with col1: m_file = st.file_uploader("1. 마스터 엑셀 업로드", type=['xlsx'], key="master_up")
+    with col2: i_file = st.file_uploader("2. AS 입고 엑셀 업로드", type=['xlsx'], key="in_up")
 
     if m_file and i_file and st.button("🚀 매칭 및 입고 시작"):
-        # [마스터 로드 및 컬럼 분석]
-        m_df = pd.read_excel(m_file).dropna(how='all').fillna("")
-        m_lookup = {}
-        
-        # 컬럼 인덱스 자동 찾기 (이름 기준)
-        def find_idx(df, keywords):
-            for i, col in enumerate(df.columns):
-                if any(k in str(col) for k in keywords): return i
+        # [컬럼 위치 탐색 함수]
+        def find_idx(columns, keywords):
+            for i, col in enumerate(columns):
+                if any(k in str(col).replace(" ", "") for k in keywords):
+                    return i
             return -1
 
-        m_idx_code = find_idx(m_df, ["품목코드", "자재번호", "Material"])
-        m_idx_name = find_idx(m_df, ["자재내역", "자재명", "Description"])
-        m_idx_vend = find_idx(m_df, ["공급업체", "Vendor"])
-        m_idx_type = find_idx(m_df, ["분류", "구분"])
+        # 1. 마스터 데이터 분석
+        m_df = pd.read_excel(m_file).dropna(how='all').fillna("")
+        m_cols = m_df.columns.tolist()
+        
+        m_idx_code = find_idx(m_cols, ["품목코드", "자재번호", "MaterialCode"])
+        m_idx_name = find_idx(m_cols, ["자재명", "자재내역", "Description"])
+        m_idx_vend = find_idx(m_cols, ["공급업체", "Vendor"])
+        m_idx_type = find_idx(m_cols, ["분류", "구분", "Type"])
 
+        m_lookup = {}
         for _, row in m_df.iterrows():
-            try:
-                code = sanitize_code(row.iloc[m_idx_code])
-                if code:
-                    m_lookup[code] = {
-                        "자재내역": str(row.iloc[m_idx_name]) if m_idx_name != -1 else "",
-                        "공급업체명": str(row.iloc[m_idx_vend]) if m_idx_vend != -1 else "",
-                        "분류구분": str(row.iloc[m_idx_type]) if m_idx_type != -1 else ""
-                    }
-            except: continue
+            code = sanitize_code(row.iloc[m_idx_code]) if m_idx_code != -1 else ""
+            if code:
+                m_lookup[code] = {
+                    "자재내역": str(row.iloc[m_idx_name]).strip() if m_idx_name != -1 else "",
+                    "공급업체명": str(row.iloc[m_idx_vend]).strip() if m_idx_vend != -1 else "",
+                    "분류구분": str(row.iloc[m_idx_type]).strip() if m_idx_type != -1 else ""
+                }
 
-        # [입고 데이터 처리]
+        # 2. 입고 데이터 분석
         try:
             i_df = pd.read_excel(i_file).dropna(how='all').fillna("")
-            # 'A/S 철거' 필터링 (첫 번째 열 기준)
-            as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
-            
-            i_idx_date = find_idx(i_df, ["입고일", "일자", "Date"])
-            i_idx_mat  = find_idx(i_df, ["자재번호", "품목코드"])
-            i_idx_spec = find_idx(i_df, ["규격", "Spec"])
-            i_idx_comp = find_idx(i_df, ["압축코드", "바코드"])
+            i_cols = i_df.columns.tolist()
 
-            recs = []
-            for i, (_, row) in enumerate(as_in.iterrows()):
-                try:
-                    cur_mat = sanitize_code(row.iloc[i_idx_mat])
-                    m_info = m_lookup.get(cur_mat, {})
-                    
-                    try: in_date = pd.to_datetime(row.iloc[i_idx_date]).strftime('%Y-%m-%d')
-                    except: in_date = "1900-01-01"
+            # 입고파일 키워드 매칭 (입고일자 추가)
+            idx_in_date = find_idx(i_cols, ["입고일자", "입고일", "Date"])
+            idx_in_mat  = find_idx(i_cols, ["자재번호", "품목코드", "Material"])
+            idx_in_spec = find_idx(i_cols, ["규격", "Spec"])
+            idx_in_comp = find_idx(i_cols, ["압축코드", "바코드", "Barcode"])
 
-                    recs.append({
-                        "압축코드": str(row.iloc[i_idx_comp]).strip() if i_idx_comp != -1 else "",
-                        "자재번호": cur_mat,
-                        "자재내역": m_info.get("자재내역", "미등록"),
-                        "규격": str(row.iloc[i_idx_spec]).strip() if i_idx_spec != -1 else "",
-                        "상태": "출고 대기",
-                        "공급업체명": m_info.get("공급업체명", "미등록"),
-                        "분류구분": m_info.get("분류구분", "미등록"),
-                        "입고일": in_date
-                    })
-                except: continue
+            # 필수 컬럼 체크 (진단 기능)
+            missing = []
+            if idx_in_date == -1: missing.append("입고일자(또는 입고일)")
+            if idx_in_mat == -1: missing.append("자재번호")
+            if idx_in_comp == -1: missing.append("압축코드")
+
+            if missing:
+                st.error(f"❌ 엑셀에서 다음 컬럼을 찾을 수 없습니다: {', '.join(missing)}")
+                st.info(f"현재 인식된 컬럼명들: {i_cols}")
+            else:
+                # 'A/S 철거' 포함 행 추출
+                as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
+                total = len(as_in)
                 
-                if len(recs) >= 200:
-                    supabase.table("as_history").insert(recs).execute()
+                if total == 0:
+                    st.warning("⚠️ 'A/S 철거' 데이터가 0건입니다. 1열을 확인하세요.")
+                else:
                     recs = []
-            
-            if recs: supabase.table("as_history").insert(recs).execute()
-            st.success("🎊 입고 완료!")
-        except Exception as e:
-            st.error(f"입고 실패: {e}. 엑셀의 제목줄 이름이 '자재번호', '입고일' 등인지 확인하세요.")
+                    p_bar = st.progress(0)
+                    for i, (_, row) in enumerate(as_in.iterrows()):
+                        cur_mat = sanitize_code(row.iloc[idx_in_mat])
+                        m_info = m_lookup.get(cur_mat, {})
+                        
+                        try: 
+                            # 다양한 날짜 형식 대응
+                            dt = pd.to_datetime(row.iloc[idx_in_date])
+                            in_date = dt.strftime('%Y-%m-%d')
+                        except: in_date = "1900-01-01"
 
+                        recs.append({
+                            "압축코드": str(row.iloc[idx_in_comp]).strip(),
+                            "자재번호": cur_mat,
+                            "자재내역": m_info.get("자재내역", "미등록"),
+                            "규격": str(row.iloc[idx_in_spec]).strip() if idx_in_spec != -1 else "",
+                            "상태": "출고 대기",
+                            "공급업체명": m_info.get("공급업체명", "미등록"),
+                            "분류구분": m_info.get("분류구분", "미등록"),
+                            "입고일": in_date
+                        })
+                        
+                        if len(recs) >= 200:
+                            supabase.table("as_history").insert(recs).execute()
+                            recs = []
+                            p_bar.progress((i+1)/total)
+                    
+                    if recs: supabase.table("as_history").insert(recs).execute()
+                    st.success(f"🎊 {total:,}건 입고 성공!")
+        except Exception as e:
+            st.error(f"치명적 오류 발생: {e}")
+
+# --- 출고/분석 탭은 이전 세션 유지 & 바이너리 다운로드 로직 유지 ---
 with tab2:
-    st.info("💡 출고 엑셀 업로드 (압축코드와 출고일자 기준)")
-    out_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'])
+    st.info("📤 출고 엑셀을 업로드하세요. (압축코드 기준 매칭)")
+    out_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_up")
     if out_file and st.button("🚀 출고 업데이트 시작"):
+        # (기존 출고 업데이트 로직과 동일)
         df_out = pd.read_excel(out_file).dropna(how='all').fillna("")
         as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
-        
         if not as_out.empty:
-            # 출고일(G열:6), 압축코드(K열:10) - 이 부분도 이름 기반으로 자동화 가능
             as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
             as_out['clean_code'] = as_out.iloc[:, 10].astype(str).str.strip()
             date_groups = as_out.groupby('clean_date')['clean_code'].apply(list).to_dict()
-            
-            for out_date, codes in date_groups.items():
-                for j in range(0, len(codes), 200):
-                    supabase.table("as_history").update({"출고일": out_date, "상태": "출고 완료"}).in_("압축코드", codes[j:j+200]).execute()
-            st.success("✅ 출고 업데이트 완료")
+            for d, c in date_groups.items():
+                for j in range(0, len(c), 200):
+                    supabase.table("as_history").update({"출고일": d, "상태": "출고 완료"}).in_("압축코드", c[j:j+200]).execute()
+            st.success("✅ 출고 완료")
 
 with tab3:
     if "data_ready" not in st.session_state:
         st.session_state.data_ready = False
-        st.session_state.bin_tat = None
-        st.session_state.bin_stay = None
-        st.session_state.bin_total = None
-
+    
     if st.button("📈 데이터 분석 시작", use_container_width=True):
         res = supabase.table("as_history").select("*").execute()
         if res.data:
@@ -140,7 +156,7 @@ with tab3:
             
             cols = ['입고일자', '자재번호', '자재내역', '규격', '공급업체명', '압축코드', 'TAT']
             
-            def to_bin(target_df):
+            def make_bin(target_df):
                 if target_df.empty: return None
                 t = target_df.copy()
                 t['입고일자'] = t['입고일'].dt.strftime('%Y-%m-%d')
@@ -149,10 +165,10 @@ with tab3:
                     t.reindex(columns=cols).to_excel(wr, index=False)
                 return out.getvalue()
 
-            df_f = df[df['분류구분'].str.contains('수리대상', na=False)]
-            st.session_state.bin_tat = to_bin(df_f[df_f['출고일'].notna()])
-            st.session_state.bin_stay = to_bin(df_f[df_f['출고일'].isna()])
-            st.session_state.bin_total = to_bin(df_f)
+            f_df = df[df['분류구분'].str.contains('수리대상', na=False)]
+            st.session_state.bin_tat = make_bin(f_df[f_df['출고일'].notna()])
+            st.session_state.bin_stay = make_bin(f_df[f_df['출고일'].isna()])
+            st.session_state.bin_total = make_bin(f_df)
             st.session_state.data_ready = True
             st.rerun()
 
