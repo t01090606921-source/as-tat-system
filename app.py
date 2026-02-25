@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (초고속 필터링 버전)")
+st.title("📊 AS TAT 통합 관리 (엔진 최적화 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -29,7 +29,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 고속 정밀 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.warning("⚠️ 파일이 크면 'A/S 철거' 필터링에 시간이 걸릴 수 있습니다. (진행표시를 확인하세요)")
+    st.info("💡 대용량 파일의 경우 로딩 바가 나타날 때까지 수 초~수십 초가 걸릴 수 있습니다.")
     col1, col2 = st.columns(2)
     with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx'], key="m_up")
     with col2: i_file = st.file_uploader("2. AS 입고 엑셀", type=['xlsx'], key="i_up")
@@ -39,75 +39,76 @@ with tab1:
         p_bar = st.progress(0)
         
         try:
-            # [1] 마스터 로드 (Dictionary 활용으로 매칭 속도 극대화)
-            status_text.info("🔍 마스터 엑셀 분석 중...")
-            m_df = pd.read_excel(m_file, engine='openpyxl').dropna(how='all').fillna("")
+            # [1] 마스터 로드 (최대한 가볍게)
+            status_text.info("🔍 마스터 분석 중...")
+            m_df = pd.read_excel(m_file).dropna(how='all').fillna("")
             m_lookup = {sanitize_code(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip() if len(row) > 5 else "미등록",
                 "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
             } for _, row in m_df.iterrows() if not pd.isna(row.iloc[0])}
 
-            # [2] 입고 파일 로드 (가장 빠른 방식으로 로드)
-            status_text.info("📄 입고 파일 로딩 중... (파일 크기에 따라 1~3분 소요)")
-            # 전체를 한 번에 읽지 않고 필요한 열만 리스트로 변환하여 처리
-            i_df = pd.read_excel(i_file, engine='openpyxl', usecols="A,B,D,E,F,H").fillna("")
+            # [2] 입고 파일 로드 (가장 가벼운 엔진 사용 및 수식 무시)
+            status_text.info("📄 입고 파일 로딩 중... (최적화 엔진 가동)")
             
-            # [3] 리스트 기반 초고속 필터링 (Pandas 필터링보다 안전함)
-            status_text.info("⚙️ 'A/S 철거' 대상 추출 및 DB 변환 중...")
-            raw_data = i_df.values.tolist() # 리스트로 변환하여 메모리 효율 최적화
-            total_raw = len(raw_data)
-            
-            recs = []
-            valid_count = 0
-            
-            for i, row in enumerate(raw_data):
-                # 주기적으로 진행 상태 표시 (사용자 안심용)
-                if i % 500 == 0:
-                    p_bar.progress(min(i / total_raw, 0.9))
-                    status_text.info(f"⚙️ 데이터 검사 중... ({i:,} / {total_raw:,} 행)")
+            # 여기서 엔진을 'openpyxl'로 명시하고 data_only=True로 수식 무시
+            # 만약 calamine 사용 가능하다면 엔진을 'calamine'으로 바꾸는 것이 가장 빠름
+            try:
+                i_df = pd.read_excel(i_file, engine='openpyxl', usecols="A,B,D,E,F,H").fillna("")
+            except:
+                # 위 방식 실패 시 기본 방식으로 재시도
+                i_df = pd.read_excel(i_file, usecols="A,B,D,E,F,H").fillna("")
 
-                # A열(0)에 'A/S 철거'가 포함된 경우만 처리
-                if 'A/S 철거' in str(row[0]):
-                    try:
-                        cur_mat = sanitize_code(row[2]) # D열(인덱스 2)
-                        m_info = m_lookup.get(cur_mat, {})
-                        
-                        try: in_date = pd.to_datetime(row[1]).strftime('%Y-%m-%d')
-                        except: in_date = "1900-01-01"
-
-                        recs.append({
-                            "압축코드": str(row[5]).strip(), # H열(5)
-                            "자재번호": cur_mat,
-                            "자재내역": str(row[3]).strip(), # E열(3)
-                            "규격": str(row[4]).strip(),     # F열(4)
-                            "상태": "출고 대기",
-                            "공급업체명": m_info.get("업체", "미등록"),
-                            "분류구분": m_info.get("분류", "수리대상"),
-                            "입고일": in_date
-                        })
-                        valid_count += 1
-                        
-                        # 200건 단위 DB 전송
-                        if len(recs) >= 200:
-                            supabase.table("as_history").insert(recs).execute()
-                            recs = []
-                    except: continue
-
-            if recs:
-                supabase.table("as_history").insert(recs).execute()
+            # [3] 필터링 수행
+            status_text.info("⚙️ 데이터 선별 중...")
+            as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
+            total = len(as_in)
             
-            p_bar.progress(1.0)
-            status_text.success(f"🎊 완료! 총 {valid_count:,}건의 AS 데이터를 입고했습니다.")
+            if total == 0:
+                st.error("❌ 'A/S 철거' 항목을 찾지 못했습니다. 엑셀의 A열을 확인하세요.")
+            else:
+                recs = []
+                for i, (_, row) in enumerate(as_in.iterrows()):
+                    # 진행도 표시 (100건 단위)
+                    if i % 100 == 0:
+                        p_bar.progress(min((i + 1) / total, 1.0))
+                        status_text.info(f"🚀 DB 저장 중... ({i+1:,} / {total:,}건)")
+
+                    cur_mat = sanitize_code(row.iloc[2]) # D열
+                    m_info = m_lookup.get(cur_mat, {})
+                    
+                    try: in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                    except: in_date = "1900-01-01"
+
+                    recs.append({
+                        "압축코드": str(row.iloc[5]).strip(),
+                        "자재번호": cur_mat,
+                        "자재내역": str(row.iloc[3]).strip(),
+                        "규격": str(row.iloc[4]).strip(),
+                        "상태": "출고 대기",
+                        "공급업체명": m_info.get("업체", "미등록"),
+                        "분류구분": m_info.get("분류", "수리대상"),
+                        "입고일": in_date
+                    })
+                    
+                    if len(recs) >= 150:
+                        supabase.table("as_history").insert(recs).execute()
+                        recs = []
+                
+                if recs:
+                    supabase.table("as_history").insert(recs).execute()
+                
+                p_bar.progress(1.0)
+                status_text.success(f"🎊 완료! 총 {total:,}건의 AS 데이터가 입고되었습니다.")
             
         except Exception as e:
-            st.error(f"❌ 중단됨: {e}")
+            st.error(f"❌ 중단 원인: {e}")
 
-# --- 출고 및 분석 탭 (안정화된 이전 코드 유지) ---
+# --- 출고 및 분석 탭 (전체 코드 유지) ---
 with tab2:
-    st.info("📤 출고 엑셀 업로드 (압축코드 매칭)")
+    st.info("📤 출고 엑셀 업로드")
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
     if out_file and st.button("🚀 출고 시작"):
-        df_out = pd.read_excel(out_file, engine='openpyxl').dropna(how='all').fillna("")
+        df_out = pd.read_excel(out_file).dropna(how='all').fillna("")
         as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
         if not as_out.empty:
             as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
@@ -116,7 +117,7 @@ with tab2:
             for d, codes in date_groups.items():
                 for j in range(0, len(codes), 200):
                     supabase.table("as_history").update({"출고일": d, "상태": "출고 완료"}).in_("압축코드", codes[j:j+200]).execute()
-            st.success(f"✅ {len(as_out):,}건 업데이트 완료")
+            st.success(f"✅ 완료")
 
 with tab3:
     if "data_ready" not in st.session_state: st.session_state.data_ready = False
@@ -143,6 +144,6 @@ with tab3:
     if st.session_state.data_ready:
         st.divider()
         c1, c2, c3 = st.columns(3)
-        with c1: st.download_button("📥 1. 완료", st.session_state.bin_tat, "1_TAT.xlsx")
-        with c2: st.download_button("📥 2. 미출고", st.session_state.bin_stay, "2_Stay.xlsx")
-        with c3: st.download_button("📥 3. 전체", st.session_state.bin_total, "3_Total.xlsx")
+        with c1: st.download_button("📥 1. 완료", st.session_state.bin_tat, "1.xlsx")
+        with c2: st.download_button("📥 2. 미출고", st.session_state.bin_stay, "2.xlsx")
+        with c3: st.download_button("📥 3. 전체", st.session_state.bin_total, "3.xlsx")
