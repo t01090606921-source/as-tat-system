@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (CSV 고속 모드)")
+st.title("📊 AS TAT 통합 관리 (CSV 인코딩 해결 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -29,80 +29,98 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 CSV 고속 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 엑셀을 'CSV(쉼표로 분리)' 형식으로 저장한 후 업로드하세요. 로딩 속도가 압도적으로 빠릅니다.")
+    st.info("💡 CSV 파일 업로드 시 한글 깨짐 및 로드 오류를 방지하는 로직이 적용되었습니다.")
     col1, col2 = st.columns(2)
-    with col1: m_file = st.file_uploader("1. 마스터 엑셀 (XLSX 권장)", type=['xlsx', 'csv'], key="m_up")
-    with col2: i_file = st.file_uploader("2. AS 입고 CSV 업로드", type=['csv'], key="i_up")
+    with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx', 'csv'], key="m_up")
+    with col2: i_file = st.file_uploader("2. AS 입고 CSV", type=['csv'], key="i_up")
 
     if m_file and i_file and st.button("🚀 CSV 입고 시작"):
         status_text = st.empty()
         p_bar = st.progress(0)
         
         try:
-            # [1] 마스터 로드
-            status_text.info("🔍 마스터 분석 중...")
-            if m_file.name.endswith('.csv'):
-                m_df = pd.read_csv(m_file, encoding='cp949').fillna("")
-            else:
-                m_df = pd.read_excel(m_file).fillna("")
+            # [1] 마스터 로드 (안전하게 로드)
+            status_text.info("🔍 마스터 데이터 분석 중...")
+            try:
+                if m_file.name.endswith('.csv'):
+                    m_df = pd.read_csv(m_file, encoding='cp949').fillna("")
+                else:
+                    m_df = pd.read_excel(m_file).fillna("")
+            except:
+                m_df = pd.read_csv(m_file, encoding='utf-8-sig').fillna("")
                 
             m_lookup = {sanitize_code(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip() if len(row) > 5 else "미등록",
                 "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
-            } for _, row in m_df.iterrows()}
+            } for _, row in m_df.iterrows() if not pd.isna(row.iloc[0])}
 
-            # [2] 입고 CSV 로드 (인코딩 예외 처리)
+            # [2] 입고 CSV 로드 (다양한 인코딩 시도)
             status_text.info("📄 CSV 파일 읽는 중...")
-            try:
-                i_df = pd.read_csv(i_file, encoding='cp949').fillna("")
-            except:
-                i_df = pd.read_csv(i_file, encoding='utf-8-sig').fillna("")
+            i_df = None
+            encodings = ['cp949', 'utf-8-sig', 'euc-kr', 'utf-8']
             
-            # [3] 필터링 및 변환
-            status_text.info("⚙️ 데이터 매칭 및 필터링 중...")
-            as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
-            total = len(as_in)
+            for enc in encodings:
+                try:
+                    i_df = pd.read_csv(i_file, encoding=enc).fillna("")
+                    # 데이터가 정상적으로 읽혔는지 확인 (열이 한 개 이상인지)
+                    if i_df.shape[1] > 1:
+                        status_text.success(f"✅ {enc} 인코딩으로 파일 로드 성공!")
+                        break
+                except:
+                    continue
             
-            if total == 0:
-                st.error("❌ 'A/S 철거' 항목을 찾지 못했습니다. CSV의 첫 번째 열을 확인하세요.")
+            if i_df is None:
+                st.error("❌ CSV 파일을 읽을 수 없습니다. 파일 형식을 확인해주세요.")
             else:
-                recs = []
-                for i, (_, row) in enumerate(as_in.iterrows()):
-                    if i % 100 == 0:
-                        p_bar.progress(min((i + 1) / total, 1.0))
-                        status_text.info(f"🚀 DB 저장 중... ({i+1:,} / {total:,}건)")
+                # [3] 필터링 및 변환
+                status_text.info("⚙️ 데이터 선별 및 DB 전송 중...")
+                # 첫 번째 컬럼에서 'A/S 철거' 필터링
+                as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
+                total = len(as_in)
+                
+                if total == 0:
+                    st.warning("⚠️ 'A/S 철거' 데이터를 찾지 못했습니다. CSV의 1열을 확인하세요.")
+                else:
+                    recs = []
+                    for i, (_, row) in enumerate(as_in.iterrows()):
+                        if i % 100 == 0:
+                            p_bar.progress(min((i + 1) / total, 1.0))
+                            status_text.info(f"🚀 처리 중... ({i+1:,} / {total:,}건)")
 
-                    cur_mat = sanitize_code(row.iloc[3])
-                    m_info = m_lookup.get(cur_mat, {})
-                    
-                    try: in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
-                    except: in_date = "1900-01-01"
+                        # 인덱스 안전장치 적용
+                        cur_mat = sanitize_code(row.iloc[3]) if len(row) > 3 else ""
+                        m_info = m_lookup.get(cur_mat, {})
+                        
+                        try:
+                            in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                        except:
+                            in_date = "1900-01-01"
 
-                    recs.append({
-                        "압축코드": str(row.iloc[7]).strip() if len(row) > 7 else "",
-                        "자재번호": cur_mat,
-                        "자재내역": str(row.iloc[4]).strip() if len(row) > 4 else "",
-                        "규격": str(row.iloc[5]).strip() if len(row) > 5 else "",
-                        "상태": "출고 대기",
-                        "공급업체명": m_info.get("업체", "미등록"),
-                        "분류구분": m_info.get("분류", "수리대상"),
-                        "입고일": in_date
-                    })
+                        recs.append({
+                            "압축코드": str(row.iloc[7]).strip() if len(row) > 7 else "",
+                            "자재번호": cur_mat,
+                            "자재내역": str(row.iloc[4]).strip() if len(row) > 4 else "",
+                            "규격": str(row.iloc[5]).strip() if len(row) > 5 else "",
+                            "상태": "출고 대기",
+                            "공급업체명": m_info.get("업체", "미등록"),
+                            "분류구분": m_info.get("분류", "수리대상"),
+                            "입고일": in_date
+                        })
+                        
+                        if len(recs) >= 200:
+                            supabase.table("as_history").insert(recs).execute()
+                            recs = []
                     
-                    if len(recs) >= 200:
+                    if recs:
                         supabase.table("as_history").insert(recs).execute()
-                        recs = []
-                
-                if recs:
-                    supabase.table("as_history").insert(recs).execute()
-                
-                p_bar.progress(1.0)
-                status_text.success(f"🎊 완료! CSV 기준 총 {total:,}건이 입고되었습니다.")
+                    
+                    p_bar.progress(1.0)
+                    status_text.success(f"🎊 완료! 총 {total:,}건이 정상 입고되었습니다.")
             
         except Exception as e:
-            st.error(f"❌ CSV 오류 발생: {e}")
+            st.error(f"❌ 처리 중 상세 오류: {e}")
 
-# --- 출고 및 분석 탭 (동일 로직 유지) ---
+# --- 출고 및 분석 탭 (기존과 동일) ---
 with tab2:
     st.info("📤 출고 엑셀 업로드")
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
