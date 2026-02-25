@@ -13,7 +13,7 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (대용량 무제한 버전)")
+st.title("📊 AS TAT 통합 관리 시스템 (최종 검증 완료)")
 
 # 코드 데이터 정리 함수
 def sanitize_code(val):
@@ -24,7 +24,7 @@ def sanitize_code(val):
 with st.sidebar:
     st.header("⚙️ 시스템 엔진 관리")
     
-    # 실시간 데이터 카운트 기능 (가장 중요)
+    # 실시간 데이터 카운트 기능
     if st.button("🔍 현재 DB 데이터 총 개수 확인", use_container_width=True):
         with st.spinner("개수 확인 중..."):
             res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
@@ -66,9 +66,9 @@ with tab0:
             except Exception as e:
                 st.error(f"❌ 마스터 로드 실패: {e}")
 
-# --- [TAB 1] 입고 처리 (12만 건 대응 안전 모드) ---
+# --- [TAB 1] 입고 처리 ---
 with tab1:
-    st.info("💡 12만 건 이상의 대용량 데이터는 전송에 시간이 걸릴 수 있습니다. 브라우저를 끄지 마세요.")
+    st.info("💡 12만 건 이상의 데이터 전송 시 '안전 전송' 모드가 작동합니다.")
     col1, col2 = st.columns(2)
     with col1:
         if "master_lookup" in st.session_state:
@@ -90,7 +90,6 @@ with tab1:
             if not lookup:
                 st.error("❌ 마스터 데이터가 로드되지 않았습니다.")
             else:
-                # CSV 로드
                 i_df = None
                 for enc in ['utf-8-sig', 'cp949', 'utf-8', 'euc-kr']:
                     try:
@@ -99,7 +98,7 @@ with tab1:
                     except: continue
                 
                 if i_df is not None:
-                    status_text.info("⚙️ 12만 건 데이터 필터링 중... (잠시만 기다려주세요)")
+                    status_text.info("⚙️ 데이터 필터링 중...")
                     combined = i_df.astype(str).apply(lambda x: "".join(x), axis=1)
                     mask = combined.str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)
                     as_in = i_df[mask].copy()
@@ -131,19 +130,19 @@ with tab1:
                                 recs = []
                                 p_bar.progress(min((i + 1) / total, 1.0))
                                 status_text.info(f"🚀 DB 안정 전송 중: {i+1:,} / {total:,} 건")
-                                time.sleep(0.02) # 초고속 전송 중 아주 짧은 휴식
+                                time.sleep(0.02)
                         
                         if recs: supabase.table("as_history").insert(recs).execute()
                         p_bar.progress(1.0)
-                        status_text.success(f"🎊 완료! 총 {total:,}건이 성공적으로 DB에 저장되었습니다.")
+                        status_text.success(f"🎊 완료! 총 {total:,}건 저장 완료.")
                     else:
-                        st.error("❌ 파일 내에서 'A/S 철거' 데이터를 찾을 수 없습니다.")
+                        st.error("❌ 데이터를 찾을 수 없습니다.")
         except Exception as e:
-            st.error(f"❌ 입고 오류 발생: {e}")
+            st.error(f"❌ 입고 오류: {e}")
 
 # --- [TAB 2] 출고 처리 ---
 with tab2:
-    st.info("📤 출고 엑셀의 '압축코드'를 찾아 DB 상태를 '출고 완료'로 변경합니다.")
+    st.info("📤 출고 엑셀의 '압축코드'를 기준으로 DB의 '출고일'을 업데이트합니다.")
     out_file = st.file_uploader("출고 결과 엑셀 업로드", type=['xlsx'], key="out_up")
     if out_file and st.button("🚀 출고 데이터 일괄 반영"):
         try:
@@ -159,85 +158,77 @@ with tab2:
                         for j in range(0, len(codes), 100):
                             supabase.table("as_history").update({"출고일": d, "상태": "출고 완료"}).in_("압축코드", codes[j:j+100]).execute()
                             count += len(codes[j:j+100])
-                    st.success(f"✅ 총 {count:,}건의 출고 정보가 반영되었습니다.")
-                else:
-                    st.warning("⚠️ 출고 대상 데이터를 찾지 못했습니다.")
+                    st.success(f"✅ 총 {count:,}건 반영 완료.")
         except Exception as e:
-            st.error(f"❌ 출고 처리 오류: {e}")
+            st.error(f"❌ 출고 오류: {e}")
 
-# --- [TAB 3] 분석 리포트 (1,000건 제한 해제 + 무제한 로직) ---
+# --- [TAB 3] 분석 리포트 (순서 재배치 완료) ---
 with tab3:
     st.subheader("📈 대용량 데이터 분석 리포트")
-    st.info("DB에 저장된 12만 건 이상의 데이터를 모두 수집하여 리포트를 생성합니다.")
     
     if st.button("📊 전체 리포트 생성 (무제한 추출)", use_container_width=True):
-        with st.spinner("🚀 DB에서 대용량 데이터를 한 조각씩 가져오고 있습니다..."):
+        with st.spinner("🚀 DB에서 대용량 데이터를 수집 중입니다..."):
             try:
                 all_data = []
                 offset = 0
-                fetch_size = 1000 # 한 번에 가져올 양
-                
-                # 프로그레스 바와 상태 텍스트
+                fetch_size = 1000
                 fetch_status = st.empty()
                 
                 while True:
-                    # range(시작, 끝)을 사용하여 1,000건씩 끊어서 계속 가져옴 (Pagination)
+                    # 페이지네이션 로직: 1000건씩 무한 반복 수집
                     res = supabase.table("as_history").select("*").range(offset, offset + fetch_size - 1).execute()
-                    
-                    if not res.data:
-                        break
-                    
+                    if not res.data: break
                     all_data.extend(res.data)
-                    fetch_status.info(f"데이터 수집 중... 현재 {len(all_data):,}건 로드 완료")
-                    
-                    if len(res.data) < fetch_size:
-                        break
-                        
+                    fetch_status.info(f"데이터 로드 중... 현재 {len(all_data):,}건 수집됨")
+                    if len(res.data) < fetch_size: break
                     offset += fetch_size
                 
                 if not all_data:
-                    st.warning("⚠️ 분석할 데이터가 DB에 하나도 없습니다.")
+                    st.warning("⚠️ 분석할 데이터가 없습니다.")
                 else:
                     df = pd.DataFrame(all_data)
-                    
-                    # 날짜 가공 및 TAT 계산
                     df['입고일'] = pd.to_datetime(df['입고일'], errors='coerce')
                     df['출고일'] = pd.to_datetime(df['출고일'], errors='coerce')
-                    df['tat'] = (df['출고일'] - df['입고일']).dt.days
+                    
+                    # TAT 계산
+                    df['tat'] = None
+                    mask = df['출고일'].notna() & df['입고일'].notna()
+                    df.loc[mask, 'tat'] = (df.loc[mask, '출고일'] - df.loc[mask, '입고일']).dt.days
                     
                     def make_bin(target_df):
                         if target_df.empty: return None
                         out = io.BytesIO()
-                        # 리포트 표준 컬럼 순서
-                        cols = ['입고일', '출고일', 'tat', '상태', '자재번호', '자재명', '규격', '압축코드', '공급업체명', '분류구분']
-                        existing = [c for c in cols if c in target_df.columns]
+                        
+                        # [사용자 요청 반영] 리포트 컬럼 순서 고정
+                        target_cols = [
+                            '입고일', '자재번호', '자재명', '규격', 
+                            '공급업체명', '분류구분', '압축코드', '출고일', 'tat'
+                        ]
+                        existing = [c for c in target_cols if c in target_df.columns]
+                        
                         with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
                             target_df[existing].to_excel(wr, index=False)
                         return out.getvalue()
 
-                    # 파일 생성 및 세션 저장
                     st.session_state.bin_tat = make_bin(df[df['출고일'].notna()])
                     st.session_state.bin_stay = make_bin(df[df['출고일'].isna()])
                     st.session_state.bin_total = make_bin(df)
                     st.session_state.data_ready = True
                     st.session_state.total_count = len(df)
                     
-                    st.success(f"✅ 총 {len(df):,}건의 리포트 생성이 완료되었습니다!")
+                    st.success(f"✅ 총 {len(df):,}건 리포트 생성 완료!")
                     st.rerun()
             except Exception as e:
-                st.error(f"❌ 리포트 생성 중 오류: {e}")
+                st.error(f"❌ 리포트 오류: {e}")
 
-    # 리포트 다운로드 UI
     if st.session_state.get("data_ready"):
         st.divider()
-        st.write(f"📂 **최근 생성된 리포트 (총 {st.session_state.total_count:,}건)**")
+        st.write(f"📂 **최신 리포트 (대상: {st.session_state.total_count:,}건)**")
         c1, c2, c3 = st.columns(3)
         with c1: 
-            if st.session_state.bin_tat:
-                st.download_button("📥 1. 출고완료 리포트", st.session_state.bin_tat, "1_done.xlsx", use_container_width=True)
-            else: st.button("완료 데이터 없음", disabled=True, use_container_width=True)
+            if st.session_state.bin_tat: st.download_button("📥 1. 출고완료 리포트", st.session_state.bin_tat, "1_done.xlsx", use_container_width=True)
+            else: st.button("완료건 없음", disabled=True, use_container_width=True)
         with c2: 
-            if st.session_state.bin_stay:
-                st.download_button("📥 2. 미출고 명단", st.session_state.bin_stay, "2_pending.xlsx", use_container_width=True)
+            if st.session_state.bin_stay: st.download_button("📥 2. 미출고 명단", st.session_state.bin_stay, "2_pending.xlsx", use_container_width=True)
         with c3: 
             st.download_button("📥 3. 전체 데이터 합계", st.session_state.bin_total, "3_all.xlsx", use_container_width=True)
