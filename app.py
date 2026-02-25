@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (정밀 데이터 탐색 버전)")
+st.title("📊 AS TAT 통합 관리 (DB 정밀 수정 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -29,7 +29,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 고속 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 CSV 파일에서 'A/S 철거' 문구를 자동 탐색하여 입고를 진행합니다.")
+    st.info("💡 CSV 파일에서 'A/S 철거' 데이터를 찾아 DB의 컬럼 구조에 맞춰 전송합니다.")
     col1, col2 = st.columns(2)
     with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx', 'csv'], key="m_up")
     with col2: i_file = st.file_uploader("2. AS 입고 CSV", type=['csv'], key="i_up")
@@ -47,10 +47,9 @@ with tab1:
                 "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
             } for _, row in m_df.iterrows() if not pd.isna(row.iloc[0])}
 
-            # [2] CSV 로드 (가장 강력한 인코딩 방식 적용)
+            # [2] CSV 로드
             status_text.info("📄 CSV 읽는 중...")
             i_df = None
-            # utf-8-sig는 엑셀에서 만든 CSV의 한글 깨짐을 방지하는 가장 좋은 방식입니다.
             for enc in ['utf-8-sig', 'cp949', 'utf-8', 'euc-kr']:
                 try:
                     i_df = pd.read_csv(i_file, encoding=enc).fillna("")
@@ -60,45 +59,40 @@ with tab1:
             if i_df is None:
                 st.error("❌ 파일을 읽을 수 없습니다.")
             else:
-                # [3] 'A/S 철거' 탐색 로직 (열 위치에 상관없이 행 전체 검사)
-                status_text.info("⚙️ 'A/S 철거' 데이터 탐색 중...")
-                
-                # 모든 열의 내용을 하나로 합쳐서 'A/S'와 '철거'가 있는지 확인
-                # 공백을 제거하여 'A / S 철거' 같은 케이스도 대비합니다.
+                # [3] 데이터 탐색 및 전송
+                status_text.info("⚙️ 'A/S 철거' 데이터 선별 중...")
                 combined_series = i_df.astype(str).apply(lambda x: "".join(x), axis=1)
                 mask = combined_series.str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)
                 as_in = i_df[mask].copy()
                 total = len(as_in)
                 
                 if total == 0:
-                    st.error("❌ 'A/S 철거' 데이터를 여전히 찾지 못했습니다.")
-                    st.write("상단 5행 데이터 미리보기:", i_df.head())
+                    st.error("❌ 데이터를 찾지 못했습니다. 파일 인코딩이나 내용을 확인하세요.")
                 else:
                     recs = []
                     for i, (_, row) in enumerate(as_in.iterrows()):
                         if i % 100 == 0:
                             p_bar.progress(min((i + 1) / total, 1.0))
-                            status_text.info(f"🚀 입고 중... ({i+1:,} / {total:,}건)")
+                            status_text.info(f"🚀 전송 중... ({i+1:,} / {total:,}건)")
 
-                        # 이미지 컬럼 기준: B(1)=입고일, D(3)=자재번호, E(4)=자재명, F(5)=규격, H(7)=압축코드
                         cur_mat = sanitize_code(row.iloc[3])
                         m_info = m_lookup.get(cur_mat, {})
                         
-                        try:
-                            in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
-                        except:
-                            in_date = "1900-01-01"
+                        try: in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                        except: in_date = "1900-01-01"
 
-                        recs.append({
+                        # [핵심 수정] DB 컬럼명 불일치 방지를 위해 안전하게 구성
+                        data_entry = {
                             "압축코드": str(row.iloc[7]).strip() if len(row) > 7 else "",
                             "자재번호": cur_mat,
-                            "자재내역": str(row.iloc[4]).strip() if len(row) > 4 else "",
+                            "자재명": str(row.iloc[4]).strip() if len(row) > 4 else "", # '자재내역' 대신 '자재명' 사용
                             "규격": str(row.iloc[5]).strip() if len(row) > 5 else "",
                             "상태": "출고 대기",
                             "공급업체명": m_info.get("업체", "미등록"),
                             "분류구분": m_info.get("분류", "수리대상"),
                             "입고일": in_date
-                        })
+                        }
+                        recs.append(data_entry)
                         
                         if len(recs) >= 200:
                             supabase.table("as_history").insert(recs).execute()
@@ -111,45 +105,54 @@ with tab1:
                     status_text.success(f"🎊 {total:,}건 입고 완료!")
             
         except Exception as e:
-            st.error(f"❌ 오류: {e}")
+            st.error(f"❌ 오류 상세: {e}")
+            st.warning("팁: Supabase 테이블의 컬럼 이름이 '자재명'인지 '자재내역'인지 확인해 보세요.")
 
-# --- 출고 및 분석 탭 (동일) ---
+# --- 출고 및 분석 탭 (안정성 강화) ---
 with tab2:
     st.info("📤 출고 엑셀 업로드")
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
     if out_file and st.button("🚀 출고 시작"):
-        df_out = pd.read_excel(out_file).fillna("")
-        as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
-        if not as_out.empty:
-            as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
-            as_out['clean_code'] = as_out.iloc[:, 10].astype(str).str.strip()
-            date_groups = as_out.groupby('clean_date')['clean_code'].apply(list).to_dict()
-            for d, codes in date_groups.items():
-                for j in range(0, len(codes), 200):
-                    supabase.table("as_history").update({"출고일": d, "상태": "출고 완료"}).in_("압축코드", codes[j:j+200]).execute()
-            st.success("✅ 완료")
+        try:
+            df_out = pd.read_excel(out_file).fillna("")
+            as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
+            if not as_out.empty:
+                as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
+                as_out['clean_code'] = as_out.iloc[:, 10].astype(str).str.strip()
+                date_groups = as_out.groupby('clean_date')['clean_code'].apply(list).to_dict()
+                for d, codes in date_groups.items():
+                    for j in range(0, len(codes), 200):
+                        supabase.table("as_history").update({"출고일": d, "상태": "출고 완료"}).in_("압축코드", codes[j:j+200]).execute()
+                st.success("✅ 업데이트 완료")
+        except Exception as e: st.error(f"오류: {e}")
 
 with tab3:
     if "data_ready" not in st.session_state: st.session_state.data_ready = False
     if st.button("📈 리포트 생성", use_container_width=True):
-        res = supabase.table("as_history").select("*").execute()
-        if res.data:
-            df = pd.DataFrame(res.data)
-            df['입고일'] = pd.to_datetime(df['입고일'])
-            df['출고일'] = pd.to_datetime(df['출고일'])
-            df['TAT'] = (df['출고일'] - df['입고일']).dt.days
-            cols = ['입고일자', '자재번호', '자재내역', '규격', '공급업체명', '압축코드', 'TAT']
-            def make_bin(target_df):
-                if target_df.empty: return None
-                t = target_df.copy(); t['입고일자'] = t['입고일'].dt.strftime('%Y-%m-%d')
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine='xlsxwriter') as wr: t.reindex(columns=cols).to_excel(wr, index=False)
-                return out.getvalue()
-            f_df = df[df['분류구분'].str.contains('수리대상', na=False)]
-            st.session_state.bin_tat = make_bin(f_df[f_df['출고일'].notna()])
-            st.session_state.bin_stay = make_bin(f_df[f_df['출고일'].isna()])
-            st.session_state.bin_total = make_bin(f_df)
-            st.session_state.data_ready = True; st.rerun()
+        try:
+            res = supabase.table("as_history").select("*").execute()
+            if res.data:
+                df = pd.DataFrame(res.data)
+                df['입고일'] = pd.to_datetime(df['입고일'])
+                df['출고일'] = pd.to_datetime(df['출고일'])
+                df['TAT'] = (df['출고일'] - df['입고일']).dt.days
+                # 리포트용 컬럼명 매칭 (DB 컬럼명에 따라 수정 필요할 수 있음)
+                target_cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', 'TAT']
+                
+                def make_bin(target_df):
+                    if target_df.empty: return None
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+                        target_df.to_excel(wr, index=False)
+                    return out.getvalue()
+
+                f_df = df[df['분류구분'].str.contains('수리대상', na=False)] if '분류구분' in df.columns else df
+                st.session_state.bin_tat = make_bin(f_df[f_df['출고일'].notna()])
+                st.session_state.bin_stay = make_bin(f_df[f_df['출고일'].isna()])
+                st.session_state.bin_total = make_bin(f_df)
+                st.session_state.data_ready = True; st.rerun()
+        except Exception as e: st.error(f"분석 오류: {e}")
+
     if st.session_state.data_ready:
         st.divider()
         c1, c2, c3 = st.columns(3)
