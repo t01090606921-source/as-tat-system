@@ -13,13 +13,13 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (최종 완성)")
+st.title("📊 AS TAT 통합 관리 시스템 (최종 완성본)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
     return str(val).split('.')[0].strip().upper()
 
-# --- 2. 사이드바 관리 (대용량 분할 삭제) ---
+# --- 2. 사이드바 관리 (삭제 시에도 카운트 표시) ---
 with st.sidebar:
     st.header("⚙️ 시스템 엔진 관리")
     if st.button("🔍 현재 DB 데이터 총 개수 확인", use_container_width=True):
@@ -34,12 +34,11 @@ with st.sidebar:
         status_box = st.empty()
         try:
             while True:
-                # 5,000건씩 끊어서 삭제하여 타임아웃 방지
                 sub_res = supabase.table("as_history").select("id").limit(5000).execute()
                 if not sub_res.data: break
                 ids_to_del = [item['id'] for item in sub_res.data]
                 supabase.table("as_history").delete().in_("id", ids_to_del).execute()
-                status_box.info(f"🗑️ 삭제 중... (현재 처리 ID: {ids_to_del[-1]})")
+                status_box.info(f"🗑️ 삭제 진행 중... (현재 ID: {ids_to_del[-1]})")
                 time.sleep(0.1)
             st.success("✅ 초기화 완료")
             st.rerun()
@@ -62,159 +61,141 @@ with tab0:
             st.success(f"✅ {len(st.session_state.master_lookup):,}건 로드 완료")
         except Exception as e: st.error(f"오류: {e}")
 
-# --- [TAB 1] 입고 처리 (복합 중복 체크: 입고일 + 압축코드) ---
+# --- [TAB 1] 입고 처리 (복합 중복 체크 & 진행률 표시) ---
 with tab1:
-    st.info("💡 [입고일 + 압축코드]가 모두 일치하는 경우만 중복으로 제외됩니다. (입고일이 다르면 추가 입고 허용)")
     i_file = st.file_uploader("AS 입고 CSV 파일 업로드", type=['csv'], key="i_up")
     if i_file and st.button("🚀 복합 중복 체크 입고 시작", use_container_width=True):
-        if "master_lookup" not in st.session_state: st.error("⚠️ [마스터 관리] 탭에서 마스터를 먼저 로드하세요.")
+        if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
-            status_text = st.empty()
+            msg = st.empty()
             p_bar = st.progress(0)
             try:
-                # 1. DB에서 (입고일 + 압축코드) 조합 로드
-                status_text.info("🔍 기존 데이터와 중복 여부 대조 중...")
+                # 1. DB 대조군 로드 (카운팅 추가)
                 existing_combos = set()
                 offset = 0
+                count_res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
+                total_db = count_res.count if count_res.count else 1
+                
                 while True:
                     res = supabase.table("as_history").select("입고일", "압축코드").range(offset, offset + 999).execute()
                     if not res.data: break
-                    for r in res.data:
-                        existing_combos.add(f"{r['입고일']}|{str(r['압축코드']).strip()}")
+                    for r in res.data: existing_combos.add(f"{r['입고일']}|{str(r['압축코드']).strip()}")
+                    offset += len(res.data)
+                    msg.info(f"🔍 기존 데이터 대조 중... ({offset:,} / {total_db:,} 건 완료)")
+                    p_bar.progress(min(offset / total_db, 1.0))
                     if len(res.data) < 1000: break
-                    offset += 1000
 
-                # 2. 입고 파일 로드 (인코딩 대응)
-                i_df = None
-                for enc in ['cp949', 'utf-8-sig', 'euc-kr']:
-                    try:
-                        i_df = pd.read_csv(i_file, encoding=enc).fillna("")
-                        if i_df.shape[1] > 1: break
-                    except: continue
-
-                if i_df is not None:
-                    combined = i_df.astype(str).apply(lambda x: "".join(x), axis=1)
-                    as_in = i_df[combined.str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)].copy()
+                # 2. 파일 분석 및 입고
+                i_df = pd.read_csv(i_file, encoding='cp949').fillna("")
+                combined = i_df.astype(str).apply(lambda x: "".join(x), axis=1)
+                as_in = i_df[combined.str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)].copy()
+                
+                recs, dup_cnt = [], 0
+                total_in = len(as_in)
+                for i, (_, row) in enumerate(as_in.iterrows()):
+                    try: in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                    except: in_date = "1900-01-01"
+                    code = str(row.iloc[7]).strip()
+                    if f"{in_date}|{code}" in existing_combos:
+                        dup_cnt += 1; continue
                     
-                    recs = []
-                    dup_cnt = 0
-                    for i, (_, row) in enumerate(as_in.iterrows()):
-                        try: in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
-                        except: in_date = "1900-01-01"
-                        code = str(row.iloc[7]).strip()
-                        
-                        # [복합키 체크] 날짜와 코드가 모두 일치해야 중복임
-                        if f"{in_date}|{code}" in existing_combos:
-                            dup_cnt += 1
-                            continue
-                        
-                        cur_mat = sanitize_code(row.iloc[3])
-                        m_info = st.session_state.master_lookup.get(cur_mat, {})
-                        recs.append({
-                            "압축코드": code, "자재번호": cur_mat, "자재명": str(row.iloc[4]).strip(),
-                            "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
-                            "분류구분": m_info.get("분류", "수리대상"), "입고일": in_date,
-                            "상태": "출고 대기"
-                        })
-                        
-                        if len(recs) >= 100:
-                            supabase.table("as_history").insert(recs).execute()
-                            recs = []
-                            p_bar.progress(min((i + 1) / len(as_in), 1.0))
-                            status_text.info(f"🚀 입고 중: {i+1:,} / {len(as_in):,}")
-                    
-                    if recs: supabase.table("as_history").insert(recs).execute()
-                    st.success(f"✅ 입고 완료 (신규: {len(as_in)-dup_cnt:,}건 / 중복제외: {dup_cnt:,}건)")
+                    cur_mat = sanitize_code(row.iloc[3])
+                    m_info = st.session_state.master_lookup.get(cur_mat, {})
+                    recs.append({
+                        "압축코드": code, "자재번호": cur_mat, "자재명": str(row.iloc[4]).strip(),
+                        "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
+                        "분류구분": m_info.get("분류", "수리대상"), "입고일": in_date, "상태": "출고 대기"
+                    })
+                    if len(recs) >= 100:
+                        supabase.table("as_history").insert(recs).execute()
+                        recs = []
+                        msg.warning(f"🚀 신규 데이터 저장 중... ({i+1:,} / {total_in:,} 건)")
+                        p_bar.progress(min((i+1)/total_in, 1.0))
+                if recs: supabase.table("as_history").insert(recs).execute()
+                st.success(f"✅ 입고 완료 (신규: {total_in-dup_cnt:,} / 중복제외: {dup_cnt:,})")
             except Exception as e: st.error(f"오류: {e}")
 
-# --- [TAB 2] 출고 처리 (복합 데이터 대응 & 선후 관계 검증) ---
+# --- [TAB 2] 출고 처리 (선후 관계 & 진행률 표시) ---
 with tab2:
-    st.info("📤 입고일보다 빠른 출고일은 업데이트되지 않으며, 이미 동일 날짜로 처리된 건도 제외됩니다.")
     out_file = st.file_uploader("출고 결과 엑셀 업로드", type=['xlsx'], key="out_up")
     if out_file and st.button("🚀 검증 후 출고 반영", use_container_width=True):
+        msg = st.empty()
+        p_bar = st.progress(0)
         try:
-            with st.spinner("DB 데이터를 대조하여 유효성을 검사 중..."):
-                df_out = pd.read_excel(out_file).fillna("")
-                as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
+            df_out = pd.read_excel(out_file).fillna("")
+            as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스', na=False)].copy()
+            
+            # DB 데이터 로드 (시각화)
+            msg.info("🔍 DB 데이터를 분석 중입니다...")
+            db_res = supabase.table("as_history").select("id", "압축코드", "입고일", "출고일", "상태").execute()
+            db_data = db_res.data
+            
+            update_list, skip_cnt = [], 0
+            total_out = len(as_out)
+            for i, (_, row) in enumerate(as_out.iterrows()):
+                code = str(row.iloc[10]).strip()
+                ex_out_date = pd.to_datetime(row.iloc[6]).strftime('%Y-%m-%d')
+                matched = [r for r in db_data if str(r['압축코드']) == code]
                 
-                # DB의 입고/출고 정보 전체 로드 (중복 압축코드 대응을 위해 리스트로 관리)
-                db_res = supabase.table("as_history").select("id", "압축코드", "입고일", "출고일", "상태").execute()
-                db_data = db_res.data
-                
-                update_list = []
-                skip_cnt = 0
-                
-                for _, row in as_out.iterrows():
-                    code = str(row.iloc[10]).strip()
-                    excel_out_date = pd.to_datetime(row.iloc[6]).strftime('%Y-%m-%d')
-                    
-                    # 해당 압축코드를 가진 모든 DB 행 찾기 (복합 입고 대응)
-                    matched_rows = [r for r in db_data if str(r['압축코드']) == code]
-                    
-                    updated_for_this_row = False
-                    for db_row in matched_rows:
-                        # 1. 선후 관계 검증: 입고일 <= 출고일
-                        if str(db_row['입고일']) <= excel_out_date:
-                            # 2. 중복 출고 방지: 이미 동일 날짜로 완료된 건 스킵
-                            if db_row['상태'] == "출고 완료" and str(db_row['출고일']) == excel_out_date:
-                                continue
-                            
-                            update_list.append({"id": db_row['id'], "출고일": excel_out_date})
-                            updated_for_this_row = True
-                    
-                    if not updated_for_this_row:
-                        skip_cnt += 1
+                valid = False
+                for db_row in matched:
+                    if str(db_row['입고일']) <= ex_out_date:
+                        if db_row['상태'] == "출고 완료" and str(db_row['출고일']) == ex_out_date: continue
+                        update_list.append({"id": db_row['id'], "출고일": ex_out_date})
+                        valid = True
+                if not valid: skip_cnt += 1
+                if i % 100 == 0: p_bar.progress(min((i+1)/total_out, 1.0))
 
-                # DB 업데이트 실행 (100건 단위 벌크가 아닌 ID별 업데이트 권장 - 데이터 무결성 위해)
-                if update_list:
-                    status_text = st.empty()
-                    for idx, item in enumerate(update_list):
-                        supabase.table("as_history").update({"출고일": item['출고일'], "상태": "출고 완료"}).eq("id", item['id']).execute()
-                        if idx % 50 == 0: status_text.info(f"🔄 출고 정보 업데이트 중: {idx:,} / {len(update_list):,}")
-                    st.success(f"✅ 반영 완료: {len(update_list):,}건 / 제외(날짜오류 등): {skip_cnt:,}건")
-                else:
-                    st.warning("⚠️ 업데이트할 대상이 없습니다.")
+            if update_list:
+                for idx, item in enumerate(update_list):
+                    supabase.table("as_history").update({"출고일": item['출고일'], "상태": "출고 완료"}).eq("id", item['id']).execute()
+                    if idx % 50 == 0: 
+                        msg.warning(f"🔄 DB 업데이트 중: {idx:,} / {len(update_list):,}")
+                        p_bar.progress(min(idx/len(update_list), 1.0))
+                st.success(f"✅ 반영: {len(update_list):,}건 / 제외: {skip_cnt:,}건")
         except Exception as e: st.error(f"오류: {e}")
 
-# --- [TAB 3] 분석 리포트 (순서 고정 & 무제한 추출) ---
+# --- [TAB 3] 분석 리포트 (무제한 추출 & 진행률 표시) ---
 with tab3:
     if st.button("📊 리포트 생성 (12만 건 무제한 추출)", use_container_width=True):
-        fetch_status = st.empty()
-        with st.spinner("🚀 DB에서 전체 데이터를 수집 중입니다..."):
-            try:
-                all_data = []
-                offset = 0
-                while True:
-                    res = supabase.table("as_history").select("*").range(offset, offset + 999).execute()
-                    if not res.data: break
-                    all_data.extend(res.data)
-                    fetch_status.info(f"데이터 로드 중... 현재 {len(all_data):,}건 수집됨")
-                    if len(res.data) < 1000: break
-                    offset += 1000
+        msg = st.empty()
+        p_bar = st.progress(0)
+        try:
+            all_data, offset = [], 0
+            count_res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
+            total_db = count_res.count if count_res.count else 1
+            
+            while True:
+                res = supabase.table("as_history").select("*").range(offset, offset + 999).execute()
+                if not res.data: break
+                all_data.extend(res.data)
+                offset += len(res.data)
+                msg.info(f"📥 데이터 수집 중... ({offset:,} / {total_db:,})")
+                p_bar.progress(min(offset/total_db, 1.0))
+                if len(res.data) < 1000: break
+            
+            if all_data:
+                df = pd.DataFrame(all_data)
+                df['입고일'] = pd.to_datetime(df['입고일'], errors='coerce')
+                df['출고일'] = pd.to_datetime(df['출고일'], errors='coerce')
+                df['tat'] = (df['출고일'] - df['입고일']).dt.days
                 
-                if all_data:
-                    df = pd.DataFrame(all_data)
-                    df['입고일'] = pd.to_datetime(df['입고일'], errors='coerce')
-                    df['출고일'] = pd.to_datetime(df['출고일'], errors='coerce')
-                    df['tat'] = (df['출고일'] - df['입고일']).dt.days
-                    
-                    # 요청하신 컬럼 순서
-                    target_cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '분류구분', '압축코드', '출고일', 'tat']
-                    existing = [c for c in target_cols if c in df.columns]
+                cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '분류구분', '압축코드', '출고일', 'tat']
+                existing = [c for c in cols if c in df.columns]
 
-                    def make_bin(target_df):
-                        if target_df.empty: return None
-                        out = io.BytesIO()
-                        with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
-                            target_df[existing].to_excel(wr, index=False)
-                        return out.getvalue()
+                def make_bin(target_df):
+                    if target_df.empty: return None
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+                        target_df[existing].to_excel(wr, index=False)
+                    return out.getvalue()
 
-                    st.session_state.bin_tat = make_bin(df[df['출고일'].notna()])
-                    st.session_state.bin_stay = make_bin(df[df['출고일'].isna()])
-                    st.session_state.bin_total = make_bin(df)
-                    st.session_state.data_ready = True
-                    st.rerun()
-            except Exception as e: st.error(f"오류: {e}")
+                st.session_state.bin_tat = make_bin(df[df['출고일'].notna()])
+                st.session_state.bin_stay = make_bin(df[df['출고일'].isna()])
+                st.session_state.bin_total = make_bin(df)
+                st.session_state.data_ready = True
+                st.rerun()
+        except Exception as e: st.error(f"오류: {e}")
 
     if st.session_state.get("data_ready"):
         st.divider()
