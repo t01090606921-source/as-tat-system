@@ -9,7 +9,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (CSV 인코딩 해결 버전)")
+st.title("📊 AS TAT 통합 관리 (CSV 정밀 필터링 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
@@ -29,7 +29,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 CSV 고속 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 CSV 파일 업로드 시 한글 깨짐 및 로드 오류를 방지하는 로직이 적용되었습니다.")
+    st.info("💡 CSV 파일의 1열에 'A/S'와 '철거'라는 단어가 포함된 모든 행을 수집합니다.")
     col1, col2 = st.columns(2)
     with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx', 'csv'], key="m_up")
     with col2: i_file = st.file_uploader("2. AS 입고 CSV", type=['csv'], key="i_up")
@@ -39,7 +39,7 @@ with tab1:
         p_bar = st.progress(0)
         
         try:
-            # [1] 마스터 로드 (안전하게 로드)
+            # [1] 마스터 로드
             status_text.info("🔍 마스터 데이터 분석 중...")
             try:
                 if m_file.name.endswith('.csv'):
@@ -54,40 +54,35 @@ with tab1:
                 "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
             } for _, row in m_df.iterrows() if not pd.isna(row.iloc[0])}
 
-            # [2] 입고 CSV 로드 (다양한 인코딩 시도)
+            # [2] 입고 CSV 로드 (인코딩 무차별 대입)
             status_text.info("📄 CSV 파일 읽는 중...")
             i_df = None
-            encodings = ['cp949', 'utf-8-sig', 'euc-kr', 'utf-8']
-            
-            for enc in encodings:
+            for enc in ['cp949', 'utf-8-sig', 'euc-kr', 'utf-8']:
                 try:
                     i_df = pd.read_csv(i_file, encoding=enc).fillna("")
-                    # 데이터가 정상적으로 읽혔는지 확인 (열이 한 개 이상인지)
-                    if i_df.shape[1] > 1:
-                        status_text.success(f"✅ {enc} 인코딩으로 파일 로드 성공!")
-                        break
-                except:
-                    continue
+                    if i_df.shape[1] >= 1: break
+                except: continue
             
             if i_df is None:
-                st.error("❌ CSV 파일을 읽을 수 없습니다. 파일 형식을 확인해주세요.")
+                st.error("❌ 파일을 읽을 수 없습니다. CSV 형식을 확인해 주세요.")
             else:
-                # [3] 필터링 및 변환
-                status_text.info("⚙️ 데이터 선별 및 DB 전송 중...")
-                # 첫 번째 컬럼에서 'A/S 철거' 필터링
-                as_in = i_df[i_df.iloc[:, 0].astype(str).str.contains('A/S 철거', na=False)].copy()
+                # [3] 필터링 개선: 'A/S'와 '철거' 단어 조합으로 검색 (공백/오타 방지)
+                status_text.info("⚙️ 데이터 선별 중...")
+                # 1열의 모든 내용을 문자열로 바꾸고 공백 제거 후 'A/S'와 '철거'가 있는지 확인
+                mask = i_df.iloc[:, 0].astype(str).str.replace(" ", "").str.contains('A/S철거|AS철거', na=False)
+                as_in = i_df[mask].copy()
                 total = len(as_in)
                 
                 if total == 0:
-                    st.warning("⚠️ 'A/S 철거' 데이터를 찾지 못했습니다. CSV의 1열을 확인하세요.")
+                    st.error("❌ 'A/S 철거' 데이터를 찾지 못했습니다.")
+                    st.write("실제 1열의 데이터 샘플:", i_df.iloc[:5, 0].tolist()) # 확인용 출력
                 else:
                     recs = []
                     for i, (_, row) in enumerate(as_in.iterrows()):
                         if i % 100 == 0:
                             p_bar.progress(min((i + 1) / total, 1.0))
-                            status_text.info(f"🚀 처리 중... ({i+1:,} / {total:,}건)")
+                            status_text.info(f"🚀 저장 중... ({i+1:,} / {total:,}건)")
 
-                        # 인덱스 안전장치 적용
                         cur_mat = sanitize_code(row.iloc[3]) if len(row) > 3 else ""
                         m_info = m_lookup.get(cur_mat, {})
                         
@@ -115,12 +110,12 @@ with tab1:
                         supabase.table("as_history").insert(recs).execute()
                     
                     p_bar.progress(1.0)
-                    status_text.success(f"🎊 완료! 총 {total:,}건이 정상 입고되었습니다.")
+                    status_text.success(f"🎊 완료! {total:,}건 입고되었습니다.")
             
         except Exception as e:
-            st.error(f"❌ 처리 중 상세 오류: {e}")
+            st.error(f"❌ 오류 발생: {e}")
 
-# --- 출고 및 분석 탭 (기존과 동일) ---
+# --- 출고 및 분석 탭 (기존 로직 유지) ---
 with tab2:
     st.info("📤 출고 엑셀 업로드")
     out_file = st.file_uploader("출고 엑셀", type=['xlsx'], key="out_up")
