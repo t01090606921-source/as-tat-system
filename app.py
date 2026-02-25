@@ -10,7 +10,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (오류 수정 및 안정화)")
+st.title("📊 AS TAT 통합 관리 (오류 원천 차단 버전)")
 
 def sanitize_code(val):
     if pd.isna(val) or val == "": return ""
@@ -20,14 +20,14 @@ def sanitize_code(val):
 with st.sidebar:
     st.header("⚙️ 시스템 관리")
     if st.button("⚠️ DB 데이터 전량 삭제", type="primary", use_container_width=True):
-        for key in list(st.session_state.keys()): del st.session_state[key]
+        st.session_state.clear() # 세션 전체 삭제
         msg = st.empty()
         while True:
             res = supabase.table("as_history").select("id").limit(1000).execute()
             if not res.data: break
             ids = [i['id'] for i in res.data]
             supabase.table("as_history").delete().in_("id", ids).execute()
-            msg.warning(f"🗑️ 삭제 진행 중...")
+            msg.warning(f"🗑️ 데이터 삭제 중...")
         st.success("초기화 완료")
         st.rerun()
 
@@ -35,7 +35,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 고속 정밀 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 마스터와 입고 파일을 함께 올려주세요. (A열: 자재코드, G열: 자재내역 기준)")
+    st.info("💡 마스터(A:코드, G:내역)와 입고 파일을 함께 올려주세요.")
     col1, col2 = st.columns(2)
     with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx'], key="m_up")
     with col2: i_file = st.file_uploader("2. AS 입고 엑셀", type=['xlsx'], key="i_up")
@@ -44,52 +44,41 @@ with tab1:
         p_bar = st.progress(0)
         status = st.empty()
         
-        # [VLOOKUP 강화] 인덱스 기반에서 안전하게 데이터 추출
         m_df = pd.read_excel(m_file, dtype=str)
         m_lookup = {}
-        
-        for idx, row in m_df.iterrows():
+        for _, row in m_df.iterrows():
             try:
-                # 안전하게 열 접근 (열 개수가 부족할 경우 대비)
-                mat_id = sanitize_code(row.iloc[0]) # A열
+                mat_id = sanitize_code(row.iloc[0])
                 if mat_id:
                     m_lookup[mat_id] = {
-                        "자재내역": str(row.iloc[6]).strip() if len(row) > 6 else "내역없음", # G열
-                        "공급업체명": str(row.iloc[5]).strip() if len(row) > 5 else "정보누락", # F열
-                        "분류구분": str(row.iloc[10]).strip() if len(row) > 10 else "정보누락" # K열
+                        "자재내역": str(row.iloc[6]).strip() if len(row) > 6 else "내역없음",
+                        "공급업체명": str(row.iloc[5]).strip() if len(row) > 5 else "정보누락",
+                        "분류구분": str(row.iloc[10]).strip() if len(row) > 10 else "정보누락"
                     }
-            except Exception:
-                continue
+            except: continue
 
-        # 입고 파일 분석
         i_df = pd.read_excel(i_file, dtype=str)
         as_in = i_df[i_df.iloc[:, 0].fillna('').str.contains('A/S 철거', na=False)].copy()
         
         recs, total = [], len(as_in)
-        if total == 0:
-            st.error("입고 대상('A/S 철거') 데이터가 없습니다.")
-        else:
+        if total > 0:
             for i, (_, row) in enumerate(as_in.iterrows()):
-                cur_mat = sanitize_code(row.iloc[3]) # D열
+                cur_mat = sanitize_code(row.iloc[3])
                 m_info = m_lookup.get(cur_mat, {})
-                
                 recs.append({
                     "압축코드": str(row.iloc[7]).strip() if not pd.isna(row.iloc[7]) else "",
                     "자재번호": cur_mat,
-                    "자재내역": m_info.get("자재내역", "미등록(마스터확인)"),
+                    "자재내역": m_info.get("자재내역", "미등록"),
                     "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
                     "상태": "출고 대기",
                     "공급업체명": m_info.get("공급업체명", "미등록"),
                     "분류구분": m_info.get("분류구분", "미등록"),
                     "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
                 })
-                
                 if len(recs) >= 200:
                     supabase.table("as_history").insert(recs).execute()
                     recs = []
                     p_bar.progress((i+1)/total)
-                    status.text(f"🚚 처리 중... {i+1}/{total}")
-            
             if recs: supabase.table("as_history").insert(recs).execute()
             st.success(f"🎊 {total:,}건 입고 완료!")
 
@@ -102,71 +91,82 @@ with tab2:
             as_out['clean_date'] = pd.to_datetime(as_out.iloc[:, 6]).dt.strftime('%Y-%m-%d')
             as_out['clean_code'] = as_out.iloc[:, 10].str.strip()
             date_groups = as_out.groupby('clean_date')['clean_code'].apply(list).to_dict()
-            total_out, out_prog, processed = len(as_out), st.progress(0), 0
+            total_out, processed = len(as_out), 0
+            out_p = st.progress(0)
             for out_date, codes in date_groups.items():
                 for j in range(0, len(codes), 200):
                     batch = codes[j:j+200]
                     supabase.table("as_history").update({"출고일": out_date, "상태": "출고 완료"}).in_("압축코드", batch).execute()
                     processed += len(batch)
-                    out_prog.progress(processed / total_out)
-            st.success("출고 완료")
+                    out_p.progress(processed / total_out)
+            st.success("출고 업데이트 완료")
 
 with tab3:
-    # 세션 상태 유지
-    if "df_tat" not in st.session_state:
-        st.session_state.df_tat = None
-        st.session_state.df_stay = None
-        st.session_state.df_total = None
+    # [수정] 분석 데이터를 바이너리 형태로 세션에 저장하여 오류 방지
+    if "data_ready" not in st.session_state:
+        st.session_state.data_ready = False
+        st.session_state.bin_tat = None
+        st.session_state.bin_stay = None
+        st.session_state.bin_total = None
+        st.session_state.counts = [0, 0, 0]
 
-    if st.button("📈 데이터 분석 시작", use_container_width=True):
-        df_raw_list = []
+    if st.button("📈 데이터 분석 시작 (결과 유지)", use_container_width=True):
+        df_list = []
         last_id = -1
-        load_msg = st.empty()
+        msg = st.empty()
         while True:
             res = supabase.table("as_history").select("*").gt("id", last_id).order("id").limit(1000).execute()
             if not res.data: break
-            df_raw_list.extend(res.data)
+            df_list.extend(res.data)
             last_id = res.data[-1]['id']
-            load_msg.info(f"📥 데이터 수집 중... ({len(df_raw_list):,}건)")
+            msg.info(f"📥 데이터 수집 중... ({len(df_list):,}건)")
         
-        if df_raw_list:
-            df_all = pd.DataFrame(df_raw_list)
-            df_all['입고일'] = pd.to_datetime(df_all['입고일'])
-            df_all['출고일'] = pd.to_datetime(df_all['출고일'])
-            df_all.loc[df_all['입고일'] > df_all['출고일'], '출고일'] = pd.NaT
-            df_all['TAT'] = (df_all['출고일'] - df_all['입고일']).dt.days
+        if df_list:
+            df = pd.DataFrame(df_list)
+            df['입고일'] = pd.to_datetime(df['입고일'])
+            df['출고일'] = pd.to_datetime(df['출고일'])
+            df.loc[df['입고일'] > df['출고일'], '출고일'] = pd.NaT
+            df['TAT'] = (df['출고일'] - df['입고일']).dt.days
             
-            cols_order = ['입고일자', '자재번호', '자재내역', '규격', '공급업체명', '압축코드', 'TAT']
+            # 컬럼 재배열
+            cols = ['입고일자', '자재번호', '자재내역', '규격', '공급업체명', '압축코드', 'TAT']
             
-            def format_df(df):
-                if df.empty: return pd.DataFrame(columns=cols_order)
-                t = df.copy()
-                t['입고일자'] = t['입고일'].dt.strftime('%Y-%m-%d')
-                return t.reindex(columns=cols_order)
+            def to_excel_bin(target_df):
+                if target_df.empty: return None
+                target_df['입고일자'] = target_df['입고일'].dt.strftime('%Y-%m-%d')
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    target_df.reindex(columns=cols).to_excel(writer, index=False)
+                return output.getvalue()
 
-            st.session_state.df_tat = format_df(df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].notna())])
-            st.session_state.df_stay = format_df(df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].isna())])
-            st.session_state.df_total = format_df(df_all[df_all['분류구분'].str.contains('수리대상', na=False)])
-            load_msg.empty()
+            # 필터링
+            df_tat = df[(df['분류구분'].str.contains('수리대상', na=False)) & (df['출고일'].notna())]
+            df_stay = df[(df['분류구분'].str.contains('수리대상', na=False)) & (df['출고일'].isna())]
+            df_total = df[df['분류구분'].str.contains('수리대상', na=False)]
 
-    if st.session_state.df_total is not None:
+            # 세션에 바이너리로 저장 (에러 방지 핵심)
+            st.session_state.bin_tat = to_excel_bin(df_tat)
+            st.session_state.bin_stay = to_excel_bin(df_stay)
+            st.session_state.bin_total = to_excel_bin(df_total)
+            st.session_state.counts = [len(df_tat), len(df_stay), len(df_total)]
+            st.session_state.data_ready = True
+            msg.empty()
+
+    if st.session_state.data_ready:
         st.divider()
         c1, c2, c3 = st.columns(3)
         with c1:
             st.subheader("✅ TAT 완료")
-            st.metric("완료", f"{len(st.session_state.df_tat):,}건")
-            buf1 = io.BytesIO()
-            st.session_state.df_tat.to_excel(buf1, index=False)
-            st.download_button("📥 1. 완료 리포트", buf1.getvalue(), "1_TAT_Completed.xlsx")
+            st.metric("완료", f"{st.session_state.counts[0]:,}건")
+            if st.session_state.bin_tat:
+                st.download_button("📥 1. 완료 리포트", st.session_state.bin_tat, "1_TAT_Completed.xlsx")
         with c2:
             st.subheader("⚠️ 미출고/재입고")
-            st.metric("잔류", f"{len(st.session_state.df_stay):,}건")
-            buf2 = io.BytesIO()
-            st.session_state.df_stay.to_excel(buf2, index=False)
-            st.download_button("📥 2. 미출고 명단", buf2.getvalue(), "2_Not_Shipped.xlsx")
+            st.metric("잔류", f"{st.session_state.counts[1]:,}건")
+            if st.session_state.bin_stay:
+                st.download_button("📥 2. 미출고 명단", st.session_state.bin_stay, "2_Not_Shipped.xlsx")
         with c3:
             st.subheader("📊 전체 데이터")
-            st.metric("총합", f"{len(st.session_state.df_total):,}건")
-            buf3 = io.BytesIO()
-            st.session_state.df_total.to_excel(buf3, index=False)
-            st.download_button("📥 3. 전체 리포트", buf3.getvalue(), "3_Total_Data.xlsx")
+            st.metric("총합", f"{st.session_state.counts[2]:,}건")
+            if st.session_state.bin_total:
+                st.download_button("📥 3. 전체 리포트", st.session_state.bin_total, "3_Total_Data.xlsx")
