@@ -10,7 +10,7 @@ key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 (미출고 데이터 추출 포함)")
+st.title("📊 AS TAT 통합 관리 (리포트 3종 & 컬럼 최적화)")
 
 def sanitize_code(val):
     if pd.isna(val): return ""
@@ -34,15 +34,24 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["📥 고속 정밀 입고", "📤 개별 출고 처리", "📈 분석 리포트"])
 
 with tab1:
-    st.info("💡 마스터와 입고 파일을 함께 올려주세요.")
+    st.info("💡 마스터와 입고 파일을 함께 올려주세요. 자재내역이 자동으로 매칭됩니다.")
     col1, col2 = st.columns(2)
     with col1: m_file = st.file_uploader("1. 마스터 엑셀", type=['xlsx'], key="m_up")
     with col2: i_file = st.file_uploader("2. AS 입고 엑셀", type=['xlsx'], key="i_up")
 
     if m_file and i_file and st.button("🚀 매칭 및 입고 시작"):
         prog_bar = st.progress(0)
+        # 마스터 엑셀 로드 (자재내역 추가 추출)
         m_df = pd.read_excel(m_file, dtype=str)
-        m_lookup = {sanitize_code(row.iloc[0]): {"공급업체명": str(row.iloc[5]).strip(), "분류구분": str(row.iloc[10]).strip()} for _, row in m_df.iterrows() if sanitize_code(row.iloc[0])}
+        m_lookup = {}
+        for _, row in m_df.iterrows():
+            mat_id = sanitize_code(row.iloc[0])
+            if mat_id:
+                m_lookup[mat_id] = {
+                    "자재내역": str(row.iloc[1]).strip() if len(row) > 1 else "", # B열: 자재내역
+                    "공급업체명": str(row.iloc[5]).strip() if len(row) > 5 else "정보누락",
+                    "분류구분": str(row.iloc[10]).strip() if len(row) > 10 else "정보누락"
+                }
         
         i_df = pd.read_excel(i_file, dtype=str)
         as_in = i_df[i_df.iloc[:, 0].fillna('').str.contains('A/S 철거', na=False)].copy()
@@ -53,16 +62,20 @@ with tab1:
             m_info = m_lookup.get(cur_mat)
             recs.append({
                 "압축코드": str(row.iloc[7]).strip() if not pd.isna(row.iloc[7]) else "",
-                "자재번호": cur_mat, "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
-                "상태": "출고 대기", "공급업체명": m_info['공급업체명'] if m_info else "미등록",
-                "분류구분": m_info['분류구분'] if m_info else "미등록", "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                "자재번호": cur_mat,
+                "자재내역": m_info['자재내역'] if m_info else "미등록", # 추가됨
+                "규격": str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else "",
+                "상태": "출고 대기",
+                "공급업체명": m_info['공급업체명'] if m_info else "미등록",
+                "분류구분": m_info['분류구분'] if m_info else "미등록",
+                "입고일": pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
             })
             if len(recs) >= 200:
                 supabase.table("as_history").insert(recs).execute()
                 recs = []
                 prog_bar.progress((i+1)/total)
         if recs: supabase.table("as_history").insert(recs).execute()
-        st.success("입고 완료")
+        st.success("입고 및 자재내역 매칭 완료")
 
 with tab2:
     st.info("💡 출고 엑셀 날짜 개별 매칭")
@@ -93,48 +106,63 @@ with tab3:
             if not res.data: break
             df_raw_list.extend(res.data)
             last_id = res.data[-1]['id']
-            load_msg.info(f"📥 전체 데이터 수집 중... ({len(df_raw_list):,}건)")
+            load_msg.info(f"📥 데이터 수집 중... ({len(df_raw_list):,}건)")
         
         if df_raw_list:
             df_all = pd.DataFrame(df_raw_list)
             df_all['입고일'] = pd.to_datetime(df_all['입고일'])
             df_all['출고일'] = pd.to_datetime(df_all['출고일'])
             
-            # 1. 재입고 건 처리 (입고일 > 출고일이면 출고일 비우기)
+            # 재입고 건 처리 (입고일 > 출고일이면 출고일 비우기)
             df_all.loc[df_all['입고일'] > df_all['출고일'], '출고일'] = pd.NaT
             
-            # 2. 데이터 분리
-            # (A) TAT 분석 대상 : 수리대상이며, 유효한 출고일이 있는 건
-            df_tat = df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].notna())].copy()
-            # (B) 미출고/재입고 대상 : 수리대상이며, 출고일이 없거나 비워진 건
-            df_stay = df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].isna())].copy()
+            # TAT 계산 (유효 건만)
+            df_all['TAT'] = (df_all['출고일'] - df_all['입고일']).dt.days
             
+            # 공통 컬럼 배열 및 명칭 정의 (이미지 3번 기준)
+            cols_order = ['입고일자', '자재번호', '자재내역', '규격', '공급업체명', '압축코드', 'TAT']
+            
+            def format_for_excel(df):
+                temp = df.copy()
+                temp['입고일자'] = temp['입고일'].dt.strftime('%Y-%m-%d')
+                temp['출고일자'] = temp['출고일'].dt.strftime('%Y-%m-%d')
+                # 재입고 건은 엑셀에 텍스트 표시
+                temp.loc[temp['출고일'].isna(), '출고일자'] = "미출고(재입고)"
+                return temp.reindex(columns=cols_order)
+
+            # 1. TAT 완료 데이터 (수리대상 + 출고일 있음)
+            df_tat = df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].notna())].copy()
+            # 2. 미출고/재입고 데이터 (수리대상 + 출고일 없음)
+            df_stay = df_all[(df_all['분류구분'].str.contains('수리대상', na=False)) & (df_all['출고일'].isna())].copy()
+            # 3. 전체 데이터 (수리대상 전체)
+            df_total = df_all[df_all['분류구분'].str.contains('수리대상', na=False)].copy()
+
             st.divider()
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
+            
             with c1:
-                st.subheader("✅ TAT 완료 데이터")
-                st.metric("분석 건수", f"{len(df_tat):,} 건")
+                st.subheader("✅ TAT 완료")
+                st.metric("완료 건수", f"{len(df_tat):,}건")
                 if not df_tat.empty:
-                    df_tat['TAT'] = (df_tat['출고일'] - df_tat['입고일']).dt.days
-                    out_tat = io.BytesIO()
-                    with pd.ExcelWriter(out_tat, engine='xlsxwriter') as writer:
-                        df_tat_xlsx = df_tat.copy()
-                        df_tat_xlsx['입고일'] = df_tat_xlsx['입고일'].dt.strftime('%Y-%m-%d')
-                        df_tat_xlsx['출고일'] = df_tat_xlsx['출고일'].dt.strftime('%Y-%m-%d')
-                        df_tat_xlsx[['입고일', '출고일', '자재번호', '규격', '공급업체명', '압축코드', 'TAT']].to_excel(writer, index=False)
-                    st.download_button("📥 TAT 완료 리포트 다운로드", out_tat.getvalue(), "AS_TAT_Completed.xlsx", key="dl_tat")
+                    xlsx_tat = io.BytesIO()
+                    format_for_excel(df_tat).to_excel(xlsx_tat, index=False, engine='xlsxwriter')
+                    st.download_button("📥 리포트 다운로드", xlsx_tat.getvalue(), "1_TAT_Completed.xlsx", key="dl_1")
 
             with c2:
-                st.subheader("⚠️ 미출고/재입고 데이터")
-                st.metric("잔류 건수", f"{len(df_stay):,} 건")
+                st.subheader("⚠️ 미출고/재입고")
+                st.metric("잔류 건수", f"{len(df_stay):,}건")
                 if not df_stay.empty:
-                    out_stay = io.BytesIO()
-                    with pd.ExcelWriter(out_stay, engine='xlsxwriter') as writer:
-                        df_stay_xlsx = df_stay.copy()
-                        df_stay_xlsx['입고일'] = df_stay_xlsx['입고일'].dt.strftime('%Y-%m-%d')
-                        df_stay_xlsx['출고일'] = "미출고(재입고)" # 엑셀상 표시
-                        df_stay_xlsx[['입고일', '출고일', '자재번호', '규격', '공급업체명', '압축코드']].to_excel(writer, index=False)
-                    st.download_button("📥 미출고 명단 다운로드", out_stay.getvalue(), "AS_Not_Shipped_List.xlsx", key="dl_stay")
+                    xlsx_stay = io.BytesIO()
+                    format_for_excel(df_stay).to_excel(xlsx_stay, index=False, engine='xlsxwriter')
+                    st.download_button("📥 명단 다운로드", xlsx_stay.getvalue(), "2_Not_Shipped.xlsx", key="dl_2")
 
-            if df_stay.empty and df_tat.empty:
-                st.warning("분류 대상인 '수리대상' 데이터가 없습니다.")
+            with c3:
+                st.subheader("📊 전체 데이터")
+                st.metric("총합 건수", f"{len(df_total):,}건")
+                if not df_total.empty:
+                    xlsx_all = io.BytesIO()
+                    format_for_excel(df_total).to_excel(xlsx_all, index=False, engine='xlsxwriter')
+                    st.download_button("📥 전체 다운로드", xlsx_all.getvalue(), "3_Total_Data.xlsx", key="dl_3")
+
+            st.write("🔍 리포트 미리보기 (최근 10건)")
+            st.dataframe(format_for_excel(df_total).head(10))
