@@ -20,11 +20,10 @@ def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
     return str(val).split('.')[0].strip().upper()
 
-# --- 2. 사이드바 (DB 제어 및 전체 초기화) ---
+# --- 2. 사이드바 (DB 제어 및 무제한 전체 삭제) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어")
     
-    # DB 현황 확인
     if st.button("🔍 현재 DB 데이터 개수 확인", use_container_width=True):
         try:
             res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
@@ -36,7 +35,6 @@ with st.sidebar:
     st.divider()
     
     st.subheader("🚨 데이터 초기화")
-    # 삭제 확인 세션 상태 관리
     if "delete_mode" not in st.session_state:
         st.session_state.delete_mode = False
 
@@ -45,37 +43,46 @@ with st.sidebar:
             st.session_state.delete_mode = True
             st.rerun()
     else:
-        st.error("⚠️ 모든 데이터를 삭제하시겠습니까?")
+        st.error("⚠️ [주의] 모든 데이터를 삭제하시겠습니까?")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("✅ 확정(삭제)", use_container_width=True):
-                status = st.empty()
-                prog = st.progress(0)
+            if st.button("✅ 확정(0건까지 삭제)", use_container_width=True):
+                status_msg = st.empty()
+                prog_bar = st.progress(0)
                 try:
-                    # 1. 모든 ID 가져오기
-                    res = supabase.table("as_history").select("id").execute()
-                    ids = [r['id'] for r in res.data]
-                    total = len(ids)
+                    # 전체 개수 파악
+                    count_res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
+                    total_to_delete = count_res.count if count_res.count else 0
                     
-                    if total > 0:
-                        batch_size = 400
-                        for i in range(0, total, batch_size):
-                            batch = ids[i:i + batch_size]
-                            supabase.table("as_history").delete().in_("id", batch).execute()
+                    if total_to_delete > 0:
+                        deleted_so_far = 0
+                        # 데이터가 없을 때까지 무한 루프 삭제 (1,000건 제한 돌파)
+                        while True:
+                            # 삭제할 ID 1,000개 추출
+                            fetch_res = supabase.table("as_history").select("id").limit(1000).execute()
+                            ids_to_del = [r['id'] for r in fetch_res.data]
                             
-                            percent = min((i + batch_size) / total, 1.0)
-                            status.warning(f"🗑️ 삭제 중... ({min(i + batch_size, total):,} / {total:,})")
-                            prog.progress(percent)
+                            if not ids_to_del:
+                                break
+                            
+                            # 삭제 실행
+                            supabase.table("as_history").delete().in_("id", ids_to_del).execute()
+                            
+                            deleted_so_far += len(ids_to_del)
+                            # 진행률 계산 (삭제 중 신규 입고 등으로 전체 수량이 변할 수 있어 1.0 제한)
+                            current_progress = min(deleted_so_far / total_to_delete, 1.0)
+                            status_msg.warning(f"🗑️ 삭제 진행 중... ({deleted_so_far:,} / {total_to_delete:,})")
+                            prog_bar.progress(current_progress)
                         
-                        status.success(f"✨ {total:,}건 삭제 완료!")
+                        status_msg.success(f"✨ 총 {deleted_so_far:,}건 삭제 완료! DB가 비워졌습니다.")
                         time.sleep(1.5)
                         st.session_state.delete_mode = False
                         st.rerun()
                     else:
-                        status.info("삭제할 데이터가 없습니다.")
+                        status_msg.info("삭제할 데이터가 없습니다.")
                         st.session_state.delete_mode = False
                 except Exception as e:
-                    st.error(f"❌ 삭제 실패: {e}")
+                    st.error(f"❌ 삭제 실패 (RLS 권한 확인 요망): {e}")
                     st.session_state.delete_mode = False
         with col2:
             if st.button("❌ 취소", use_container_width=True):
@@ -88,33 +95,29 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입�
 # --- [TAB 0] 마스터 관리 ---
 with tab0:
     st.subheader("📋 마스터 기준 정보 등록")
-    m_file = st.file_uploader("마스터 파일을 선택하세요 (XLSX, CSV)", type=['xlsx', 'csv'], key="master_v15")
-    
+    m_file = st.file_uploader("마스터 파일 선택 (XLSX, CSV)", type=['xlsx', 'csv'], key="master_v16")
     if m_file:
         if st.button("🔄 마스터 데이터 로드", use_container_width=True):
             try:
                 msg = st.empty()
-                msg.info("⌛ 로드 중...")
                 m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-                
                 st.session_state.master_lookup = {sanitize_code(row.iloc[0]): {
                     "업체": str(row.iloc[5]).strip() if len(row) > 5 else "미등록",
                     "분류": str(row.iloc[10]).strip() if len(row) > 10 else "수리대상"
                 } for _, row in m_df.iterrows() if not pd.isna(row.iloc[0])}
-                msg.success(f"✅ 완료: {len(st.session_state.master_lookup):,}건")
+                msg.success(f"✅ 로드 완료: {len(st.session_state.master_lookup):,}건")
             except Exception as e: st.error(f"오류: {e}")
 
 # --- [TAB 1] 입고 처리 ---
 with tab1:
     st.subheader("📥 AS 입고 (중복 체크)")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_v15")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_v16")
     if i_file and st.button("🚀 입고 시작", use_container_width=True):
         if "master_lookup" not in st.session_state:
             st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
             ui_msg, ui_prog = st.empty(), st.progress(0)
             try:
-                # DB 중복 체크용 로드
                 existing = set()
                 offset = 0
                 while True:
@@ -134,36 +137,38 @@ with tab1:
                 recs, dup, total = [], 0, len(as_in)
 
                 for i, (_, row) in enumerate(as_in.iterrows()):
-                    in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
-                    code = str(row.iloc[7]).strip().upper()
-                    if f"{in_date}|{code}" in existing:
-                        dup += 1; continue
-                    
-                    m_info = st.session_state.master_lookup.get(sanitize_code(row.iloc[3]), {})
-                    recs.append({
-                        "압축코드": code, "자재번호": sanitize_code(row.iloc[3]), "자재명": str(row.iloc[4]).strip(),
-                        "공급업체명": m_info.get("업체", "미등록"), "분류구분": m_info.get("분류", "수리대상"),
-                        "입고일": in_date, "상태": "출고 대기"
-                    })
-                    if len(recs) >= 200:
-                        supabase.table("as_history").insert(recs).execute()
-                        recs = []; ui_msg.warning(f"🚀 저장 중... ({i+1:,}/{total})"); ui_prog.progress((i+1)/total)
+                    try:
+                        in_date = pd.to_datetime(row.iloc[1]).strftime('%Y-%m-%d')
+                        code = str(row.iloc[7]).strip().upper()
+                        if f"{in_date}|{code}" in existing:
+                            dup += 1; continue
+                        
+                        m_info = st.session_state.master_lookup.get(sanitize_code(row.iloc[3]), {})
+                        recs.append({
+                            "압축코드": code, "자재번호": sanitize_code(row.iloc[3]), "자재명": str(row.iloc[4]).strip(),
+                            "공급업체명": m_info.get("업체", "미등록"), "분류구분": m_info.get("분류", "수리대상"),
+                            "입고일": in_date, "상태": "출고 대기"
+                        })
+                        if len(recs) >= 200:
+                            supabase.table("as_history").insert(recs).execute()
+                            recs = []; ui_msg.warning(f"🚀 저장 중... ({i+1:,}/{total})"); ui_prog.progress((i+1)/total)
+                    except: continue
                 
                 if recs: supabase.table("as_history").insert(recs).execute()
-                ui_msg.success(f"✅ 신규 저장: {total-dup:,}건"); ui_prog.progress(1.0)
+                ui_msg.success(f"✅ 완료 (저장: {total-dup:,})"); ui_prog.progress(1.0)
             except Exception as e: st.error(f"오류: {e}")
 
 # --- [TAB 2] 출고 처리 ---
 with tab2:
     st.subheader("📤 AS 출고 및 TAT 반영")
-    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_v15")
+    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_v16")
     if o_file and st.button("🚀 출고 반영 시작", use_container_width=True):
         ui_msg, ui_prog = st.empty(), st.progress(0)
         try:
             df_out = pd.read_excel(o_file).fillna("")
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS 카톤 박스')].copy()
             
-            ui_msg.info("🔍 DB 로드 중...")
+            ui_msg.info("🔍 DB 데이터 로드 중...")
             db_res = supabase.table("as_history").select("id, 압축코드, 입고일").execute()
             db_lookup = {}
             for r in db_res.data:
@@ -173,13 +178,15 @@ with tab2:
             
             upd_list, total_o = [], len(as_out)
             for i, (_, row) in enumerate(as_out.iterrows()):
-                code = str(row.iloc[10]).upper()
-                out_date = pd.to_datetime(row.iloc[6]).strftime('%Y-%m-%d')
-                for db_r in db_lookup.get(code, []):
-                    if db_r['입고일'] <= out_date:
-                        upd_list.append({"id": db_r['id'], "출고일": out_date})
-                if i % 100 == 0:
-                    ui_msg.info(f"🧪 검증 중... ({i+1:,}/{total_o})"); ui_prog.progress((i+1)/total_o)
+                try:
+                    code = str(row.iloc[10]).upper()
+                    out_date = pd.to_datetime(row.iloc[6]).strftime('%Y-%m-%d')
+                    for db_r in db_lookup.get(code, []):
+                        if db_r['입고일'] <= out_date:
+                            upd_list.append({"id": db_r['id'], "출고일": out_date})
+                    if i % 100 == 0:
+                        ui_msg.info(f"🧪 검증 중... ({i+1:,}/{total_o})"); ui_prog.progress((i+1)/total_o)
+                except: continue
 
             for idx, item in enumerate(upd_list):
                 supabase.table("as_history").update({"출고일": item['출고일'], "상태": "출고 완료"}).eq("id", item['id']).execute()
@@ -190,7 +197,7 @@ with tab2:
 
 # --- [TAB 3] 리포트 ---
 with tab3:
-    if st.button("📊 리포트 생성", use_container_width=True):
+    if st.button("📊 분석 리포트 생성", use_container_width=True):
         ui_msg = st.empty()
         try:
             data, offset = [], 0
@@ -198,11 +205,10 @@ with tab3:
                 res = supabase.table("as_history").select("*").range(offset, offset + 999).execute()
                 if not res.data: break
                 data.extend(res.data); offset += len(res.data)
-                ui_msg.info(f"📥 수집 중... ({offset:,}건)")
+                ui_msg.info(f"📥 데이터 수집 중... ({offset:,}건)")
                 if len(res.data) < 1000: break
             df = pd.DataFrame(data)
             df['tat'] = (pd.to_datetime(df['출고일']) - pd.to_datetime(df['입고일'])).dt.days
-            
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='xlsxwriter') as wr: df.to_excel(wr, index=False)
             st.session_state.report = out.getvalue(); ui_msg.success("✅ 생성 완료")
