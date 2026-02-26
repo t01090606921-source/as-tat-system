@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import io
-import time
 from datetime import datetime
 
 # --- 1. Supabase 접속 설정 ---
@@ -14,9 +13,9 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (멀티 출고 반영)")
+st.title("📊 AS TAT 통합 관리 시스템 (최종 확정본)")
 
-# [데이터 정제]
+# [데이터 정제 함수]
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
     return str(val).split('.')[0].replace(" ", "").strip().upper()
@@ -38,20 +37,20 @@ with st.sidebar:
         if st.button("💣 DB 전체 데이터 삭제", use_container_width=True, type="primary"):
             st.session_state.delete_mode = True; st.rerun()
     else:
-        st.error("⚠️ 전체 삭제하시겠습니까?")
+        st.error("⚠️ 데이터를 전부 삭제하시겠습니까?")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("✅ 확정"):
+            if st.button("✅ 확정", use_container_width=True):
                 msg = st.empty()
                 while True:
                     fetch = supabase.table("as_history").select("id").limit(1000).execute()
                     ids = [r['id'] for r in fetch.data]
                     if not ids: break
                     supabase.table("as_history").delete().in_("id", ids).execute()
-                    msg.warning("🗑️ 데이터 삭제 중...")
+                    msg.warning("🗑️ 삭제 진행 중...")
                 st.session_state.delete_mode = False; st.success("삭제 완료"); st.rerun()
         with c2:
-            if st.button("❌ 취소"):
+            if st.button("❌ 취소", use_container_width=True):
                 st.session_state.delete_mode = False; st.rerun()
 
 # --- 3. 메인 기능 탭 ---
@@ -64,7 +63,7 @@ with tab0:
     if m_file and st.button("🔄 마스터 데이터 로드", use_container_width=True):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-            # A(0):코드, F(5):공급업체명, K(10):분류구분
+            # 마스터: A(0):코드, F(5):공급업체명, K(10):분류구분
             st.session_state.master_lookup = {sanitize_code(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip(),
                 "분류": str(row.iloc[10]).strip()
@@ -92,8 +91,8 @@ with tab1:
                     recs.append({
                         "압축코드": sanitize_code(row.iloc[7]),
                         "자재번호": mat_no,
-                        "자재명": str(row.iloc[4]).strip(),
-                        "규격": str(row.iloc[5]).strip(),
+                        "자재명": str(row.iloc[4]).strip(),   # E(4): 자재명
+                        "규격": str(row.iloc[5]).strip(),     # F(5): 규격
                         "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"),
                         "입고일": str(to_pure_date(row.iloc[1])),
@@ -107,9 +106,9 @@ with tab1:
                 ui_prog.progress(1.0)
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (디지타스 vs 벤더 구분 로직)
+# [TAB 2] 출고 처리 (P열 출고지에 따른 분기 로직)
 with tab2:
-    st.subheader("📤 AS 출고 처리 (멀티 목적지)")
+    st.subheader("📤 AS 출고 처리")
     o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_v_final")
     if o_file and st.button("🚀 출고 데이터 반영", use_container_width=True):
         ui_msg, ui_prog = st.empty(), st.progress(0)
@@ -119,7 +118,7 @@ with tab2:
             
             if len(as_out) == 0: st.error("❌ 'AS 카톤 박스' 행 없음.")
             else:
-                # 상태가 '벤더 출고 완료'가 아닌 모든 건 조회 (재매칭 가능하도록)
+                # 벤더 출고 완료가 아닌 건들(입고상태 또는 디지타스 출고상태) 조회
                 db_res = supabase.table("as_history").select("*").neq("상태", "벤더 출고 완료").order("입고일").execute()
                 db_lookup = {}
                 for r in db_res.data:
@@ -129,13 +128,14 @@ with tab2:
                 
                 count = 0
                 for i, (_, row) in enumerate(as_out.iterrows()):
-                    code = sanitize_code(row.iloc[10])   # K열: 압축코드
-                    out_date = to_pure_date(row.iloc[6]) # G열: 출고일
-                    dest = str(row.iloc[15]).strip()    # P열: 출고지
+                    code = sanitize_code(row.iloc[10])      # K(10): 압축코드
+                    out_date = to_pure_date(row.iloc[6])    # G(6): 출고일자
+                    dest = str(row.iloc[15]).strip()        # P(15): 출고지
                     
                     if code in db_lookup and db_lookup[code]:
                         for idx, db_r in enumerate(db_lookup[code]):
                             if to_pure_date(db_r['입고일']) <= out_date:
+                                # 출고지가 디지타스인 경우와 아닌 경우 분기 저장
                                 if dest == "주식회사디지타스":
                                     upd = {"디지타스_출고일": str(out_date), "상태": "디지타스 출고"}
                                 else:
@@ -146,10 +146,10 @@ with tab2:
                                 count += 1
                                 break
                     ui_prog.progress(min((i+1)/len(as_out), 1.0))
-                ui_msg.success(f"✅ {count:,}건 출고 정보 업데이트 완료")
+                ui_msg.success(f"✅ {count:,}건 업데이트 완료")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 3] 리포트 생성 (최종 컬럼 구조 및 TAT 로직)
+# [TAB 3] 리포트 생성 (최종 컬럼 구조 및 TAT 계산)
 with tab3:
     st.subheader("📈 AS TAT 분석 리포트")
     
@@ -164,16 +164,16 @@ with tab3:
 
     def prepare_excel(df):
         if df.empty: return None
-        # 날짜 객체 변환
+        # 날짜 타입 변환
         in_d = pd.to_datetime(df['입고일'], errors='coerce')
         dg_d = pd.to_datetime(df['디지타스_출고일'], errors='coerce')
         vn_d = pd.to_datetime(df['벤더_출고일'], errors='coerce')
         
-        # TAT 계산: 벤더일자 우선, 없으면 디지타스일자 기준
+        # TAT 계산 로직 (벤더 출고일 우선, 없으면 디지타스 기준)
         df['TAT'] = (vn_d - in_d).dt.days
         df.loc[df['TAT'].isna(), 'TAT'] = (dg_d - in_d).dt.days
         
-        # 포맷팅
+        # 출력 포맷팅
         df['입고일'] = in_d.dt.strftime('%Y-%m-%d')
         df['디지타스_출고일'] = dg_d.dt.strftime('%Y-%m-%d').fillna("-")
         df['벤더_출고일'] = vn_d.dt.strftime('%Y-%m-%d').fillna("-")
@@ -181,20 +181,17 @@ with tab3:
         df['벤더_출고지'] = df['벤더_출고지'].fillna("-").replace("", "-")
         
         # 요청하신 최종 컬럼 배열
-        cols = [
-            '입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', 
-            '분류구분', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태'
-        ]
-        for c in cols:
-            if c not in df.columns: df[c] = "-"
-            
+        cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', 
+                '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
+        
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
             df[cols].to_excel(wr, index=False)
         return output.getvalue()
 
-    if st.button("📊 전체 리포트 생성 및 미리보기", use_container_width=True):
+    if st.button("📊 전체 리포트 생성 및 다운로드", use_container_width=True):
         raw_df = fetch_all()
-        report_data = prepare_excel(raw_df)
-        st.download_button("📥 엑셀 다운로드", report_data, f"AS_TAT_REPORT_{datetime.now().strftime('%Y%m%d')}.xlsx")
-        st.dataframe(raw_df)
+        excel_bin = prepare_excel(raw_df)
+        if excel_bin:
+            st.download_button("📥 엑셀 다운로드", excel_bin, f"AS_Report_{datetime.now().strftime('%Y%m%d')}.xlsx")
+            st.dataframe(raw_df)
