@@ -49,8 +49,8 @@ with st.sidebar:
                     ids = [r['id'] for r in fetch.data]
                     if not ids: break
                     supabase.table("as_history").delete().in_("id", ids).execute()
-                    msg.warning(f"🗑️ 삭제 중... ({len(ids)}건씩 처리)")
-                st.session_state.delete_mode = False; st.success("삭제 완료"); time.sleep(1); st.rerun()
+                    msg.warning("🗑️ 삭제 진행 중...")
+                st.session_state.delete_mode = False; st.success("삭제 완료"); st.rerun()
         with c2:
             if st.button("❌ 취소", use_container_width=True):
                 st.session_state.delete_mode = False; st.rerun()
@@ -58,29 +58,27 @@ with st.sidebar:
 # --- 3. 메인 기능 탭 ---
 tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 출고 처리", "📈 분석 리포트"])
 
-# [TAB 0] 마스터 관리 (규격 정보 수집 추가)
+# [TAB 0] 마스터 관리 (업체/분류 매칭용)
 with tab0:
     st.subheader("📋 마스터 기준 정보 등록")
-    m_file = st.file_uploader("마스터 파일(XLSX, CSV)", type=['xlsx', 'csv'], key="m_final")
+    m_file = st.file_uploader("마스터 파일(XLSX, CSV)", type=['xlsx', 'csv'], key="m_v_final")
     if m_file and st.button("🔄 마스터 데이터 로드", use_container_width=True):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-            # index 설명: 0(코드), 3(자재번호), 5(업체), 6(규격), 10(분류)
-            # 파일 양식에 따라 iloc 인덱스를 조정하세요.
+            # 마스터: A(0):코드, F(5):공급업체명, K(10):분류구분
             st.session_state.master_lookup = {sanitize_code(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip(),
-                "분류": str(row.iloc[10]).strip(),
-                "규격": str(row.iloc[6]).strip() 
+                "분류": str(row.iloc[10]).strip()
             } for _, row in m_df.iterrows()}
-            st.success(f"✅ 마스터 로드 완료: {len(st.session_state.master_lookup):,}건 (규격 포함)")
+            st.success(f"✅ 마스터 로드 완료: {len(st.session_state.master_lookup):,}건")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 1] 입고 처리 (DB 저장 시 규격 반영)
+# [TAB 1] 입고 처리 (입고 엑셀: E(4)=자재명, F(5)=규격 사용)
 with tab1:
     st.subheader("📥 AS 입고")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_final")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final")
     if i_file and st.button("🚀 입고 프로세스 시작", use_container_width=True):
-        if "master_lookup" not in st.session_state: st.error("⚠️ 마스터 데이터를 먼저 로드하세요.")
+        if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
             ui_msg, ui_prog = st.empty(), st.progress(0)
             try:
@@ -89,32 +87,35 @@ with tab1:
                     except: continue
                 
                 as_in = i_df[i_df.astype(str).apply(lambda x: "".join(x), axis=1).str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)].copy()
+                
                 recs = []
                 for i, (_, row) in enumerate(as_in.iterrows()):
-                    # 마스터에서 규격, 업체, 분류 가져오기
-                    m_info = st.session_state.master_lookup.get(sanitize_code(row.iloc[3]), {})
+                    mat_no = sanitize_code(row.iloc[3]) # D(3): 자재번호
+                    m_info = st.session_state.master_lookup.get(mat_no, {})
+                    
                     recs.append({
-                        "압축코드": sanitize_code(row.iloc[7]),
-                        "자재번호": sanitize_code(row.iloc[3]),
-                        "자재명": str(row.iloc[4]).strip(),
-                        "규격": m_info.get("규격", "-"),
+                        "압축코드": sanitize_code(row.iloc[7]), # H(7): 압축코드
+                        "자재번호": mat_no,
+                        "자재명": str(row.iloc[4]).strip(),   # E(4): 자재명 (입고파일 직접 사용)
+                        "규격": str(row.iloc[5]).strip(),     # F(5): 규격 (입고파일 직접 사용)
                         "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"),
-                        "입고일": str(to_pure_date(row.iloc[1])),
+                        "입고일": str(to_pure_date(row.iloc[1])), # B(1): 입고일
                         "상태": "출고 대기"
                     })
                     if len(recs) >= 200:
                         supabase.table("as_history").insert(recs).execute()
                         recs = []; ui_prog.progress((i+1)/len(as_in))
+                
                 if recs: supabase.table("as_history").insert(recs).execute()
-                ui_msg.success(f"✅ 입고 완료 (규격 정보 매칭 성공)")
+                ui_msg.success("✅ 입고 완료 (자재명: E열 / 규격: F열 정상 반영)")
                 ui_prog.progress(1.0)
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (선입선출 FIFO 매칭)
+# [TAB 2] 출고 처리 (선입선출 1:1 매칭)
 with tab2:
-    st.subheader("📤 AS 출고 및 TAT 반영 (1:1 FIFO)")
-    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_final")
+    st.subheader("📤 AS 출고 및 TAT 반영")
+    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_v_final")
     if o_file and st.button("🚀 출고 데이터 반영", use_container_width=True):
         ui_msg, ui_prog = st.empty(), st.progress(0)
         try:
@@ -132,8 +133,8 @@ with tab2:
                 
                 upd_list = []
                 for i, (_, row) in enumerate(as_out.iterrows()):
-                    code = sanitize_code(row.iloc[10])
-                    out_date = to_pure_date(row.iloc[6])
+                    code = sanitize_code(row.iloc[10]) # K(10): 압축코드
+                    out_date = to_pure_date(row.iloc[6]) # G(6): 출고일
                     if code in db_lookup and db_lookup[code]:
                         for idx, db_r in enumerate(db_lookup[code]):
                             if to_pure_date(db_r['입고일']) <= out_date:
@@ -145,7 +146,7 @@ with tab2:
                     for item in upd_list:
                         supabase.table("as_history").update({"출고일": item['출고일'], "상태": "출고 완료"}).eq("id", item['id']).execute()
                     ui_msg.success(f"✅ {len(upd_list):,}건 출고 반영 성공")
-                else: st.warning("⚠️ 매칭된 데이터가 없습니다.")
+                else: st.warning("매칭된 데이터가 없습니다.")
         except Exception as e: st.error(f"오류: {e}")
 
 # [TAB 3] 리포트 생성 (정렬 및 필터링)
@@ -163,16 +164,15 @@ with tab3:
 
     def to_excel(df):
         if df.empty: return None
-        df['입고일'] = pd.to_datetime(df['입고일'])
-        df['출고일'] = pd.to_datetime(df['출고일'])
-        df['TAT'] = (df['출고일'] - df['입고일']).dt.days
-        df['입고일'] = df['입고일'].dt.strftime('%Y-%m-%d')
-        df['출고일'] = df['출고일'].dt.strftime('%Y-%m-%d').fillna("-")
-        df['TAT'] = df['TAT'].fillna("-")
-        # 컬럼 순서 고정 (규격 포함)
+        df['입고일'] = pd.to_datetime(df['입고일']).dt.strftime('%Y-%m-%d')
+        df['출고일'] = pd.to_datetime(df['출고일']).dt.strftime('%Y-%m-%d').fillna("-")
+        df['TAT'] = (pd.to_datetime(df['출고일'], errors='coerce') - pd.to_datetime(df['입고일'], errors='coerce')).dt.days.fillna("-")
+        
+        # [컬럼 순서 고정] 사용자 요청 양식
         cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '분류구분', '출고일', 'TAT', '상태']
-        for c in cols: 
+        for c in cols:
             if c not in df.columns: df[c] = "-"
+        
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
             df[cols].to_excel(wr, index=False)
@@ -189,7 +189,6 @@ with tab3:
         st.session_state.r3 = to_excel(df[df['상태'] != '출고 완료'])
 
     st.divider()
-    d1, d2, d3 = st.columns(3)
-    if "r1" in st.session_state: d1.download_button("📥 전체 다운로드", st.session_state.r1, "01_전체리포트.xlsx", use_container_width=True)
-    if "r2" in st.session_state: d2.download_button("📥 매칭건 다운로드", st.session_state.r2, "02_매칭리포트.xlsx", use_container_width=True)
-    if "r3" in st.session_state: d3.download_button("📥 미등록 다운로드", st.session_state.r3, "03_미등록리포트.xlsx", use_container_width=True)
+    if "r1" in st.session_state: st.download_button("📥 전체 다운로드", st.session_state.r1, "전체_리포트.xlsx")
+    if "r2" in st.session_state: st.download_button("📥 매칭건 다운로드", st.session_state.r2, "매칭_리포트.xlsx")
+    if "r3" in st.session_state: st.download_button("📥 미등록 다운로드", st.session_state.r3, "미등록_리포트.xlsx")
