@@ -26,7 +26,7 @@ def to_pure_date(val):
     try: return pd.to_datetime(val).date()
     except: return None
 
-# --- 2. 사이드바 (DB 관리) ---
+# --- 2. 사이드바 (DB 관리 및 무제한 삭제) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어")
     if st.button("🔍 현재 DB 데이터 개수 확인", use_container_width=True):
@@ -45,11 +45,12 @@ with st.sidebar:
             if st.button("✅ 확정", use_container_width=True):
                 msg = st.empty()
                 while True:
+                    # 1,000건씩 끊어서 0건이 될 때까지 무한 루프 삭제
                     fetch = supabase.table("as_history").select("id").limit(1000).execute()
                     ids = [r['id'] for r in fetch.data]
                     if not ids: break
                     supabase.table("as_history").delete().in_("id", ids).execute()
-                    msg.warning("🗑️ 삭제 진행 중...")
+                    msg.warning(f"🗑️ 삭제 진행 중... ({len(ids)}건 단위)")
                 st.session_state.delete_mode = False; st.success("삭제 완료"); st.rerun()
         with c2:
             if st.button("❌ 취소", use_container_width=True):
@@ -73,7 +74,7 @@ with tab0:
             st.success(f"✅ 마스터 로드 완료: {len(st.session_state.master_lookup):,}건")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 1] 입고 처리 (입고 엑셀: E(4)=자재명, F(5)=규격 사용)
+# [TAB 1] 입고 처리 (입고 엑셀 데이터 기반 저장)
 with tab1:
     st.subheader("📥 AS 입고")
     i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final")
@@ -86,6 +87,7 @@ with tab1:
                     try: i_file.seek(0); i_df = pd.read_csv(i_file, encoding=enc).fillna(""); break
                     except: continue
                 
+                # 'AS철거' 포함 행만 추출
                 as_in = i_df[i_df.astype(str).apply(lambda x: "".join(x), axis=1).str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)].copy()
                 
                 recs = []
@@ -108,11 +110,11 @@ with tab1:
                         recs = []; ui_prog.progress((i+1)/len(as_in))
                 
                 if recs: supabase.table("as_history").insert(recs).execute()
-                ui_msg.success("✅ 입고 완료 (자재명: E열 / 규격: F열 정상 반영)")
+                ui_msg.success("✅ 입고 완료")
                 ui_prog.progress(1.0)
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (선입선출 1:1 매칭)
+# [TAB 2] 출고 처리 (선입선출 FIFO 매칭)
 with tab2:
     st.subheader("📤 AS 출고 및 TAT 반영")
     o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_v_final")
@@ -145,11 +147,11 @@ with tab2:
                 if upd_list:
                     for item in upd_list:
                         supabase.table("as_history").update({"출고일": item['출고일'], "상태": "출고 완료"}).eq("id", item['id']).execute()
-                    ui_msg.success(f"✅ {len(upd_list):,}건 출고 반영 성공")
+                    ui_msg.success(f"✅ {len(upd_list):,}건 반영 성공")
                 else: st.warning("매칭된 데이터가 없습니다.")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 3] 리포트 생성 (정렬 및 필터링)
+# [TAB 3] 리포트 생성 (요청하신 컬럼 순서 고정)
 with tab3:
     st.subheader("📈 분석 리포트 생성")
     
@@ -168,8 +170,8 @@ with tab3:
         df['출고일'] = pd.to_datetime(df['출고일']).dt.strftime('%Y-%m-%d').fillna("-")
         df['TAT'] = (pd.to_datetime(df['출고일'], errors='coerce') - pd.to_datetime(df['입고일'], errors='coerce')).dt.days.fillna("-")
         
-        # [컬럼 순서 고정] 사용자 요청 양식
-        cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '분류구분', '출고일', 'TAT', '상태']
+        # [최종 확정 순서] 입고일 ~ 상태 (압축코드 위치: 공급업체명 뒤)
+        cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', '출고일', 'TAT', '상태']
         for c in cols:
             if c not in df.columns: df[c] = "-"
         
@@ -189,6 +191,6 @@ with tab3:
         st.session_state.r3 = to_excel(df[df['상태'] != '출고 완료'])
 
     st.divider()
-    if "r1" in st.session_state: st.download_button("📥 전체 다운로드", st.session_state.r1, "전체_리포트.xlsx")
-    if "r2" in st.session_state: st.download_button("📥 매칭건 다운로드", st.session_state.r2, "매칭_리포트.xlsx")
-    if "r3" in st.session_state: st.download_button("📥 미등록 다운로드", st.session_state.r3, "미등록_리포트.xlsx")
+    if "r1" in st.session_state: st.download_button("📥 전체 다운로드", st.session_state.r1, "전체_리포트.xlsx", use_container_width=True)
+    if "r2" in st.session_state: st.download_button("📥 매칭건 다운로드", st.session_state.r2, "매칭_리포트.xlsx", use_container_width=True)
+    if "r3" in st.session_state: st.download_button("📥 미등록 다운로드", st.session_state.r3, "미등록_리포트.xlsx", use_container_width=True)
