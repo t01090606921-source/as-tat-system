@@ -34,19 +34,17 @@ def load_data_file(file):
             return None
 
 # --- 1. 시스템 설정 및 DB 접속 ---
-st.set_page_config(page_title="AS TAT 시스템", layout="wide")
+st.set_page_config(page_title="AS TAT 시스템 Pro", layout="wide")
 
 try:
     url: str = st.secrets["SUPABASE_URL"]
     key: str = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
-    # 연결 테스트
-    supabase.table("as_history").select("id").limit(1).execute()
 except Exception as e:
-    st.error("❌ Supabase 연결 실패. (대시보드의 Max Rows 설정을 120,000으로 변경했는지 확인하세요)")
+    st.error("❌ Supabase 연결 실패. secrets 설정을 확인하세요.")
     st.stop()
 
-st.title("📊 AS TAT 통합 관리 시스템 (v2.0)")
+st.title("🚀 AS TAT 통합 관리 시스템 (초고속 벌크 모드)")
 
 # --- 2. 사이드바 (시스템 제어) ---
 with st.sidebar:
@@ -72,12 +70,12 @@ with st.sidebar:
                 st.session_state.delete_mode = False; st.rerun()
 
 # --- 3. 메인 기능 탭 ---
-tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 출고 처리", "📈 분석 리포트"])
+tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 초고속 출고", "📈 분석 리포트"])
 
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 기준 정보 등록")
-    m_file = st.file_uploader("마스터 파일 업로드 (O열에 대상여부 포함)", type=['xlsx', 'csv'], key="master_up")
+    m_file = st.file_uploader("마스터 파일 업로드", type=['xlsx', 'csv'], key="master_up")
     if m_file and st.button("🔄 마스터 데이터 로드"):
         m_df = load_data_file(m_file)
         if m_df is not None:
@@ -88,20 +86,18 @@ with tab0:
                     "대상여부": str(row.iloc[14]).strip() if len(row) > 14 else ""
                 } for _, row in m_df.iterrows()
             }
-            st.success(f"✅ 마스터 데이터 로드 완료 ({len(st.session_state.master_lookup):,}건)")
+            st.success(f"✅ 마스터 로드 완료 ({len(st.session_state.master_lookup):,}건)")
 
 # [TAB 1] 입고 처리
 with tab1:
     st.subheader("📥 AS 입고 프로세스")
     i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_up")
     if i_file and st.button("🚀 입고 데이터 반영"):
-        if "master_lookup" not in st.session_state: 
-            st.warning("⚠️ 마스터 데이터를 먼저 로드해주세요.")
+        if "master_lookup" not in st.session_state: st.warning("⚠️ 마스터 먼저 로드")
         else:
             i_df = load_data_file(i_file)
             if i_df is not None:
                 try:
-                    # 'AS철거' 관련 키워드 공백 무시 검색
                     as_in = i_df[i_df.astype(str).apply(lambda x: "".join(x), axis=1).str.replace(" ", "").str.contains("A/S철거|AS철거", na=False)].copy()
                     recs = []
                     for _, row in as_in.iterrows():
@@ -119,95 +115,94 @@ with tab1:
                     st.success(f"✅ {len(as_in):,}건 입고 완료")
                 except Exception as e: st.error(f"입고 오류: {e}")
 
-# [TAB 2] 출고 처리
+# [TAB 2] 출고 처리 (RPC 초고속 버전)
 with tab2:
-    st.subheader("📤 AS 출고 처리 (공백 및 대용량 대응)")
+    st.subheader("📤 AS 출고 처리 (RPC 벌크 엔진)")
     o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="out_up")
-    if o_file and st.button("🚀 출고 데이터 반영"):
+    if o_file and st.button("🚀 초고속 반영 시작"):
         try:
             df_out = load_data_file(o_file)
-            # 공백 제거 후 'AS카톤박스' 검색 (AS 카톤 박스 등 모든 형태 대응)
+            # 공백 제거 후 'AS카톤박스' 검색
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.replace(" ", "").str.contains('AS카톤박스', case=False)].copy()
             
             if as_out.empty:
-                st.error("❌ 출고 파일 4번째 열에서 'AS 카톤 박스'를 찾을 수 없습니다.")
+                st.error("❌ 'AS 카톤 박스' 항목을 찾지 못했습니다.")
             else:
                 as_out['is_digitas'] = as_out.iloc[:, 15].astype(str).str.contains("주식회사디지타스")
                 as_out = as_out.sort_values(by='is_digitas', ascending=False)
 
-                # DB 전체 로드 (순차 매칭을 위해 전체 데이터 필요)
-                db_res = supabase.table("as_history").select("*").order("입고일").limit(120000).execute()
-                db_data = {r['id']: r for r in db_res.data}
-                
-                success_count = 0
+                # 1. DB 전체 데이터 로드 (매칭 최적화를 위해 딕셔너리 구성)
+                with st.spinner("DB 매칭 데이터 로드 중..."):
+                    db_res = supabase.table("as_history").select("id, 압축코드, 디지타스_출고일, 벤더_출고일").limit(120000).execute()
+                    db_dict = {}
+                    for r in db_res.data:
+                        c = sanitize_code(r['압축코드'])
+                        if c not in db_dict: db_dict[c] = []
+                        db_dict[c].append(r)
+
+                # 2. 매칭 시뮬레이션 및 페이로드 생성
+                update_payload = []
                 failed_codes = []
+                
+                for _, row in as_out.iterrows():
+                    code = sanitize_code(row.iloc[10]); out_date = str(to_pure_date(row.iloc[6])); dest = str(row.iloc[15]).strip()
+                    is_dg = "주식회사디지타스" in dest
+                    target_id = None
+                    
+                    if code in db_dict:
+                        for rdata in db_dict[code]:
+                            if is_dg and not rdata.get('디지타스_출고일'):
+                                target_id = rdata['id']; rdata['디지타스_출고일'] = out_date; break
+                            elif not is_dg and not rdata.get('벤더_출고일'):
+                                target_id = rdata['id']; rdata['벤더_출고일'] = out_date; break
+                    
+                    if target_id:
+                        update_payload.append({
+                            "id": target_id, "dest": dest, "out_date": out_date, "is_dg": is_dg,
+                            "status": "벤더 출고 완료" if not is_dg else "디지타스 출고"
+                        })
+                    else: failed_codes.append(code)
 
-                with st.spinner("10만 건 이상의 데이터를 대조 중입니다..."):
-                    for _, row in as_out.iterrows():
-                        code = sanitize_code(row.iloc[10]) 
-                        out_date = to_pure_date(row.iloc[6])
-                        dest = str(row.iloc[15]).strip()
-                        target_id = None
-                        
-                        # 매칭 로직 (디지타스 여부에 따른 분기)
-                        is_dg = "주식회사디지타스" in dest
-                        for rid, rdata in db_data.items():
-                            if sanitize_code(rdata['압축코드']) == code:
-                                if is_dg and not rdata.get('디지타스_출고일'):
-                                    target_id = rid; break
-                                elif not is_dg and not rdata.get('벤더_출고일'):
-                                    target_id = rid; break
-                        
-                        if target_id:
-                            upd = {"벤더_출고지": dest, "벤더_출고일": str(out_date), "상태": "벤더 출고 완료" if not is_dg else "디지타스 출고"}
-                            if is_dg: upd["디지타스_출고일"] = str(out_date)
-                            
-                            supabase.table("as_history").update(upd).eq("id", target_id).execute()
-                            db_data[target_id].update(upd); success_count += 1
-                        else:
-                            failed_codes.append(code)
-
-                st.success(f"✅ 반영 완료: {success_count:,}건")
+                # 3. RPC 벌크 업데이트 실행 (500건씩 묶어 전송)
+                if update_payload:
+                    st.info(f"총 {len(update_payload):,}건을 DB 엔진에 전송합니다...")
+                    bar = st.progress(0)
+                    chunk_size = 500
+                    for i in range(0, len(update_payload), chunk_size):
+                        chunk = update_payload[i:i + chunk_size]
+                        supabase.rpc("bulk_update_as_out", {"p_data": chunk}).execute()
+                        bar.progress(min((i + chunk_size) / len(update_payload), 1.0))
+                    st.success(f"✅ 반영 완료: {len(update_payload):,}건")
                 if failed_codes:
-                    with st.expander("⚠️ 매칭 실패 상세 (DB에 입고 기록이 없는 코드)"):
+                    with st.expander("⚠️ 매칭 실패 상세"):
                         st.write(list(set(failed_codes)))
-
         except Exception as e: st.error(f"출고 오류: {e}")
 
 # [TAB 3] 리포트 생성
 with tab3:
-    st.subheader("📈 AS TAT 분석 리포트 (전체 조회)")
+    st.subheader("📈 AS TAT 분석 리포트")
     if st.button("📊 리포트 생성"):
-        with st.spinner("전체 누적 데이터를 불러오는 중입니다..."):
+        with st.spinner("대량 데이터 집계 중..."):
             res = supabase.table("as_history").select("*").order("입고일", desc=True).limit(120000).execute()
             df = pd.DataFrame(res.data)
         
         if not df.empty:
-            with st.spinner("TAT 계산 및 데이터 가공 중..."):
+            with st.spinner("가공 중..."):
                 in_d = pd.to_datetime(df['입고일'], errors='coerce')
                 dg_d = pd.to_datetime(df['디지타스_출고일'], errors='coerce')
                 vn_d = pd.to_datetime(df['벤더_출고일'], errors='coerce')
-                
-                # TAT: 최종 출고일(벤더 우선) 기준 계산
                 df['TAT'] = (vn_d - in_d).dt.days
                 df.loc[df['TAT'].isna(), 'TAT'] = (dg_d - in_d).dt.days
-                
                 df['입고일'] = in_d.dt.strftime('%Y-%m-%d')
                 df['디지타스_출고일'] = dg_d.dt.strftime('%Y-%m-%d').fillna("-")
                 df['벤더_출고일'] = vn_d.dt.strftime('%Y-%m-%d').fillna("-")
-                df['벤더_출고지'] = df['벤더_출고지'].replace("", "-").fillna("-")
-                df['대상여부'] = df['대상여부'].replace("", "-").fillna("-")
                 df['TAT'] = df['TAT'].apply(lambda x: f"{int(x)}일" if pd.notna(x) else "-")
                 
                 cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', 
                         '대상여부', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
-                
-                st.write(f"📢 전체 로드 데이터: **{len(df):,}** 건")
-                st.dataframe(df[cols].head(5000), use_container_width=True) # 화면 부하 방지용 head
+                st.write(f"📢 조회: {len(df):,}건"); st.dataframe(df[cols].head(5000))
                 
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
-                    df[cols].to_excel(wr, index=False, sheet_name='TOTAL_REPORT')
-                st.download_button("📥 전체 리포트 엑셀 다운로드", output.getvalue(), "AS_TAT_REPORT_FULL.xlsx")
-        else:
-            st.info("조회된 데이터가 없습니다.")
+                    df[cols].to_excel(wr, index=False, sheet_name='TAT_Report')
+                st.download_button("📥 전체 리포트 엑셀 다운로드", output.getvalue(), "AS_TAT_TOTAL_REPORT.xlsx")
