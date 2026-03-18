@@ -10,10 +10,10 @@ try:
     key: str = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except Exception as e:
-    st.error("⚠️ Supabase 접속 설정을 확인해주세요.")
+    st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (초고속 벌크 엔진)")
+st.title("📊 AS TAT 통합 관리 시스템 (고속 하이브리드 엔진)")
 
 # [데이터 정제 함수]
 def sanitize_code(val):
@@ -27,7 +27,7 @@ def to_pure_date(val):
 # --- 2. 사이드바 (DB 관리) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어")
-    if st.button("🔍 DB 전체 수량 확인", use_container_width=True):
+    if st.button("🔍 DB 데이터 총 수량 확인", use_container_width=True):
         res = supabase.table("as_history").select("id", count="exact").limit(1).execute()
         st.metric("현재 저장된 데이터", f"{res.count if res.count is not None else 0:,} 건")
     
@@ -39,28 +39,37 @@ with st.sidebar:
     else:
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("✅ 확정"):
-                supabase.table("as_history").delete().neq("id", 0).execute()
+            if st.button("✅ 확정", use_container_width=True):
+                msg = st.empty()
+                while True:
+                    fetch = supabase.table("as_history").select("id").limit(1000).execute()
+                    ids = [r['id'] for r in fetch.data]
+                    if not ids: break
+                    supabase.table("as_history").delete().in_("id", ids).execute()
+                    msg.warning("🗑️ 삭제 중...")
                 st.session_state.delete_mode = False; st.success("삭제 완료"); st.rerun()
         with c2:
-            if st.button("❌ 취소"):
+            if st.button("❌ 취소", use_container_width=True):
                 st.session_state.delete_mode = False; st.rerun()
 
 # --- 3. 메인 기능 탭 ---
 tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 출고 처리", "📈 분석 리포트"])
 
-# [TAB 0/1] 마스터 및 입고 (기존 효율적 로직 유지)
+# [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일", type=['xlsx', 'csv'], key="m_v7")
+    m_file = st.file_uploader("마스터 파일", type=['xlsx', 'csv'], key="m_v8")
     if m_file and st.button("🔄 마스터 로드"):
-        m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-        st.session_state.master_lookup = {sanitize_code(row.iloc[0]): {"업체": str(row.iloc[5]).strip(), "분류": str(row.iloc[10]).strip()} for _, row in m_df.iterrows()}
-        st.success("✅ 마스터 로드 완료")
+        try:
+            m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
+            st.session_state.master_lookup = {sanitize_code(row.iloc[0]): {"업체": str(row.iloc[5]).strip(), "분류": str(row.iloc[10]).strip()} for _, row in m_df.iterrows()}
+            st.success("✅ 마스터 로드 완료")
+        except Exception as e: st.error(f"오류: {e}")
 
+# [TAB 1] 입고 처리
 with tab1:
     st.subheader("📥 AS 입고")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v7")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v8")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("마스터 로드 필요")
         else:
@@ -83,82 +92,77 @@ with tab1:
                 st.success("✅ 입고 완료")
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (초고속 벌크 매칭 엔진)
+# [TAB 2] 출고 처리 (고속 메모리 매칭 + 벌크 업데이트)
 with tab2:
-    st.subheader("📤 AS 출고 처리 (벌크 가속 엔진)")
-    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_v7")
+    st.subheader("📤 AS 출고 처리 (하이브리드 고속 엔진)")
+    o_file = st.file_uploader("출고 엑셀 업로드", type=['xlsx'], key="o_v8")
     if o_file and st.button("🚀 출고 반영 시작"):
         try:
             df_out = pd.read_excel(o_file).fillna("")
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.replace(" ", "").str.contains('AS카톤박스', case=False)].copy()
-            
             as_out['is_digitas'] = as_out.iloc[:, 15].astype(str).str.contains("주식회사디지타스")
             as_out = as_out.sort_values(by='is_digitas', ascending=False)
 
-            ui_msg = st.empty()
-            success_count = 0
+            ui_status = st.empty()
             
-            # [최적화] 전체 데이터를 한 번에 가져오는 대신, 이번 파일에 있는 압축코드만 골라서 '벌크 로드'
-            unique_codes = as_out.iloc[:, 10].apply(sanitize_code).unique().tolist()
+            # 1. 메모리 고속 로딩 (미출고 데이터 전체 로드)
             db_data = {}
-            for i in range(0, len(unique_codes), 500):
-                batch = unique_codes[i:i+500]
-                res = supabase.table("as_history").select("*").in_("압축코드", batch).neq("상태", "벤더 출고 완료").order("입고일").execute()
+            offset = 0
+            while True:
+                ui_status.info(f"📥 매칭 데이터 수집 중... ({offset:,} 건)")
+                res = supabase.table("as_history").select("*").neq("상태", "벤더 출고 완료").range(offset, offset + 1000).execute()
+                if not res.data: break
                 for r in res.data:
                     c = sanitize_code(r['압축코드'])
                     if c not in db_data: db_data[c] = []
                     db_data[c].append(r)
+                offset += len(res.data)
+                if len(res.data) < 1000: break
             
-            # 매칭 및 업데이트 리스트 생성
+            # 2. 메모리 상에서 초고속 매칭
+            success_count = 0
             updates = []
             for i, (idx, row) in enumerate(as_out.iterrows()):
-                code = sanitize_code(row.iloc[10])
-                out_date = str(to_pure_date(row.iloc[6]))
-                dest = str(row.iloc[15]).strip()
+                code = sanitize_code(row.iloc[10]); out_date = str(to_pure_date(row.iloc[6])); dest = str(row.iloc[15]).strip()
                 
                 target_r = None
                 if code in db_data:
                     candidates = db_data[code]
                     if dest == "주식회사디지타스":
-                        # 디지타스 날짜가 없는 행 탐색
                         for r in candidates:
-                            if not r.get('디지타스_출고일'):
-                                target_r = r; break
+                            if not r.get('디지타스_출고일'): target_r = r; break
                     else:
-                        # 디지타스 날짜가 있는 행 우선 탐색
                         for r in candidates:
-                            if r.get('디지타스_출고일') and not r.get('벤더_출고일'):
-                                target_r = r; break
-                        if not target_r: # 없으면 입고 대기건
+                            if r.get('디지타스_출고일') and not r.get('벤더_출고일'): target_r = r; break
+                        if not target_r:
                             for r in candidates:
-                                if not r.get('디지타스_출고일') and not r.get('벤더_출고일'):
-                                    target_r = r; break
+                                if not r.get('디지타스_출고일') and not r.get('벤더_출고일'): target_r = r; break
                 
                 if target_r:
                     if dest == "주식회사디지타스":
                         upd = {"id": target_r['id'], "디지타스_출고일": out_date, "상태": "디지타스 출고"}
-                        target_r['디지타스_출고일'] = out_date # 메모리 갱신
+                        target_r['디지타스_출고일'] = out_date
                     else:
                         upd = {"id": target_r['id'], "벤더_출고지": dest, "벤더_출고일": out_date, "상태": "벤더 출고 완료"}
-                        candidates.remove(target_r) # 완료 건 제거
+                        candidates.remove(target_r)
                     
                     updates.append(upd)
                     success_count += 1
                 
-                # [벌크 실행] 100건씩 묶어서 DB 업데이트 (속도 향상의 핵심)
+                # 3. 100건씩 벌크 업데이트 (통신 횟수 최소화)
                 if len(updates) >= 100:
                     for u in updates:
                         id_val = u.pop('id')
                         supabase.table("as_history").update(u).eq("id", id_val).execute()
                     updates = []
-                    ui_msg.info(f"⚡ 벌크 가속 처리 중... ({i+1}/{len(as_out)} 건)")
+                    ui_status.warning(f"⚡ DB 반영 중... ({i+1}/{len(as_out)} 건)")
 
-            # 남은 데이터 처리
+            # 남은 데이터 마저 업데이트
             for u in updates:
                 id_val = u.pop('id')
                 supabase.table("as_history").update(u).eq("id", id_val).execute()
 
-            ui_msg.success(f"✅ 총 {success_count}건이 초고속으로 반영되었습니다.")
+            ui_status.success(f"✅ {success_count}건 반영 완료되었습니다.")
         except Exception as e: st.error(f"오류: {e}")
 
 # [TAB 3] 리포트 생성 (기간 필터링)
@@ -175,7 +179,7 @@ with tab3:
             res = supabase.table("as_history").select("*").gte("입고일", str(s_d)).lte("입고일", str(e_d)).range(offset, offset+1000).order("입고일").execute()
             if not res.data: break
             all_d.extend(res.data); offset += len(res.data)
-            status.info(f"📥 추출 중... ({offset:,}건)")
+            status.info(f"📥 데이터 추출 중... ({offset:,}건)")
             if len(res.data) < 1000: break
         
         if all_d:
@@ -190,11 +194,11 @@ with tab3:
             df['디지타스_출고일'] = dg_dt.dt.strftime('%Y-%m-%d').fillna("-")
             df['벤더_출고일'] = vn_dt.dt.strftime('%Y-%m-%d').fillna("-")
             df['TAT'] = df['TAT'].fillna("-")
+            df['벤더_출고지'] = df['벤더_출고지'].fillna("-")
             
             cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                 df[cols].to_excel(wr, index=False)
-            st.download_button(f"📥 {s_d}_{e_d}_리포트 다운로드", output.getvalue(), f"AS_Report_{s_d}_{e_d}.xlsx")
+            st.download_button("📥 엑셀 다운로드", output.getvalue(), f"AS_Report_{s_d}_{e_d}.xlsx")
             st.dataframe(df[cols].head(50))
-        else: st.warning("조회된 데이터가 없습니다.")
