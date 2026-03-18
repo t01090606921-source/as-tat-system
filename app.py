@@ -13,7 +13,7 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (AS 구분 반영본)")
+st.title("📊 AS TAT 통합 관리 시스템 (대상여부 명칭 반영본)")
 
 # [데이터 정제 함수]
 def sanitize_code(val):
@@ -55,16 +55,15 @@ with st.sidebar:
                 st.session_state.delete_mode = False; st.rerun()
 
 # --- 3. 메인 기능 탭 ---
-tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 고속 출고(충돌 방지)", "📈 분석 리포트"])
+tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 고속 출고", "📈 분석 리포트"])
 
-# [TAB 0] 마스터 관리 (O열: AS 구분)
+# [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록 (O열: AS 구분)")
-    m_file = st.file_uploader("마스터 파일(O열에 AS 구분 포함)", type=['csv', 'xlsx'], key="m_v_final_as_gb")
+    m_file = st.file_uploader("마스터 파일(O열 포함)", type=['csv', 'xlsx'], key="m_v_final_target_yn")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-            # O열(index 14)을 'AS 구분'으로 저장
             st.session_state.master_lookup = {
                 sanitize_code(row.iloc[0]): {
                     "업체": str(row.iloc[5]).strip(), 
@@ -77,8 +76,8 @@ with tab0:
 
 # [TAB 1] 입고 처리
 with tab1:
-    st.subheader("📥 AS 입고 (AS 구분 자동 매칭)")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final_as_gb")
+    st.subheader("📥 AS 입고 진행")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final_target_yn")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
@@ -95,18 +94,18 @@ with tab1:
                         "압축코드": sanitize_code(row.iloc[7]), "자재번호": mat_no, "자재명": str(row.iloc[4]).strip(),
                         "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"),
-                        "대상구분": m_info.get("AS구분", "미등록"), # DB 컬럼명은 '대상구분'으로 유지(기존 스키마 호환)
+                        "대상여부": m_info.get("AS구분", "미등록"), # DB 컬럼명 반영
                         "입고일": str(to_pure_date(row.iloc[1])), "상태": "출고 대기"
                     })
                     if len(recs) >= 500: supabase.table("as_history").insert(recs).execute(); recs = []
                 if recs: supabase.table("as_history").insert(recs).execute()
-                st.success("✅ 입고 완료")
-            except Exception as e: st.error(f"오류: {e}")
+                st.success("✅ 입고 완료 (대상여부 데이터 포함)")
+            except Exception as e: st.error(f"DB 오류: {e}\n\n💡 Supabase 테이블에 '대상여부' 컬럼이 있는지 확인해주세요.")
 
 # [TAB 2] 출고 처리
 with tab2:
     st.subheader("📤 AS 출고 처리")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v_final_as_gb")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v_final_target_yn")
     if o_file and st.button("🚀 출고 반영 시작"):
         try:
             for enc in ['utf-8-sig', 'cp949']:
@@ -167,11 +166,10 @@ with tab2:
 
             if upsert_dict:
                 supabase.table("as_history").upsert(list(upsert_dict.values())).execute()
-
             ui_status.success(f"✅ {success_count}건 반영 완료!")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 3] 리포트 생성 (최종 컬럼명: AS 구분)
+# [TAB 3] 리포트 생성
 with tab3:
     st.subheader("📈 분석 리포트")
     c1, c2 = st.columns(2)
@@ -190,16 +188,12 @@ with tab3:
         
         if all_d:
             df = pd.DataFrame(all_d)
+            # DB 컬럼 '대상여부'를 리포트용 'AS 구분'으로 매핑
+            if '대상여부' in df.columns:
+                df = df.rename(columns={'대상여부': 'AS 구분'})
             
-            # DB 컬럼 '대상구분'을 리포트용 'AS 구분'으로 이름 변경
-            if '대상구분' in df.columns:
-                df = df.rename(columns={'대상구분': 'AS 구분'})
-            
-            # 컬럼 부재 시 방어 로직
-            if 'AS 구분' not in df.columns:
-                df['AS 구분'] = "미등록"
-            else:
-                df['AS 구분'] = df['AS 구분'].fillna("미등록")
+            if 'AS 구분' not in df.columns: df['AS 구분'] = "미등록"
+            else: df['AS 구분'] = df['AS 구분'].fillna("미등록")
 
             in_dt, dg_dt, vn_dt = pd.to_datetime(df['입고일'], errors='coerce'), pd.to_datetime(df['디지타스_출고일'], errors='coerce'), pd.to_datetime(df['벤더_출고일'], errors='coerce')
             df['TAT'] = (vn_dt - in_dt).dt.days
@@ -208,13 +202,12 @@ with tab3:
             df['입고일'], df['디지타스_출고일'], df['벤더_출고일'] = in_dt.dt.strftime('%Y-%m-%d'), dg_dt.dt.strftime('%Y-%m-%d').fillna("-"), vn_dt.dt.strftime('%Y-%m-%d').fillna("-")
             df['TAT'], df['벤더_출고지'] = df['TAT'].fillna("-"), df['벤더_출고지'].fillna("-")
             
-            # 최종 리포트 컬럼 구성 (AS 구분 반영)
             cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', 'AS 구분', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
             available_cols = [c for c in cols if c in df.columns]
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                 df[available_cols].to_excel(wr, index=False)
-            st.download_button("📥 최종 리포트 다운로드", output.getvalue(), f"AS_Report_{s_d}.xlsx")
+            st.download_button("📥 최종 리포트 다운로드", output.getvalue(), f"AS_Report_{datetime.now().strftime('%Y%m%d')}.xlsx")
             st.dataframe(df[available_cols].head(100))
         else: st.warning("데이터가 없습니다.")
