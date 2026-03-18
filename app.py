@@ -13,7 +13,7 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (전체 CSV 고속 엔진)")
+st.title("📊 AS TAT 통합 관리 시스템 (초고속 벌크 엔진)")
 
 # [데이터 정제 함수]
 def sanitize_code(val):
@@ -46,7 +46,7 @@ with st.sidebar:
                     ids = [r['id'] for r in fetch.data]
                     if not ids: break
                     supabase.table("as_history").delete().in_("id", ids).execute()
-                    msg.warning("🗑️ 삭제 중...")
+                    msg.warning("🗑️ 데이터 삭제 중...")
                 st.session_state.delete_mode = False; st.success("삭제 완료"); st.rerun()
         with c2:
             if st.button("❌ 취소", use_container_width=True):
@@ -58,7 +58,7 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입�
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일(CSV 권장)", type=['csv', 'xlsx'], key="m_v9")
+    m_file = st.file_uploader("마스터 파일(CSV 권장)", type=['csv', 'xlsx'], key="m_v11")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
@@ -66,10 +66,10 @@ with tab0:
             st.success("✅ 마스터 로드 완료")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 1] 입고 처리 (CSV 전용)
+# [TAB 1] 입고 처리
 with tab1:
     st.subheader("📥 AS 입고 (CSV)")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v9")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v11")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("마스터 먼저 로드")
         else:
@@ -87,23 +87,23 @@ with tab1:
                         "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"), "입고일": str(to_pure_date(row.iloc[1])), "상태": "출고 대기"
                     })
-                    if len(recs) >= 300: supabase.table("as_history").insert(recs).execute(); recs = []
+                    if len(recs) >= 500: supabase.table("as_history").insert(recs).execute(); recs = []
                 if recs: supabase.table("as_history").insert(recs).execute()
                 st.success("✅ 입고 완료")
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (CSV 고속 엔진)
+# [TAB 2] 출고 처리 (진짜 벌크 고속 엔진)
 with tab2:
-    st.subheader("📤 AS 출고 처리 (CSV 고속 엔진)")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v9")
+    st.subheader("📤 AS 출고 처리 (초고속 벌크 엔진)")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v11")
     if o_file and st.button("🚀 출고 데이터 분석 및 반영"):
         try:
             for enc in ['utf-8-sig', 'cp949']:
                 try: o_file.seek(0); df_out = pd.read_csv(o_file, encoding=enc).fillna(""); break
                 except: continue
             
-            # CSV 기준 열 번호 확인 (엑셀과 동일하게 G:6, K:10, P:15 가정)
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.replace(" ", "").str.contains('AS카톤박스', case=False)].copy()
+            # 디지타스행을 먼저 처리하여 누적 가능케 정렬
             as_out['is_digitas'] = as_out.iloc[:, 15].astype(str).str.contains("주식회사디지타스")
             as_out = as_out.sort_values(by='is_digitas', ascending=False)
 
@@ -123,9 +123,9 @@ with tab2:
                 offset += len(res.data)
                 if len(res.data) < 1000: break
             
-            # 2. 메모리 고속 매칭 및 벌크 업데이트
+            # 2. 메모리 매칭 및 벌크 리스트 생성
             success_count = 0
-            updates = []
+            upsert_list = []
             for i, (idx, row) in enumerate(as_out.iterrows()):
                 code = sanitize_code(row.iloc[10]); out_date = str(to_pure_date(row.iloc[6])); dest = str(row.iloc[15]).strip()
                 target_r = None
@@ -142,31 +142,36 @@ with tab2:
                                 if not r.get('디지타스_출고일') and not r.get('벤더_출고일'): target_r = r; break
                 
                 if target_r:
-                    upd = {"id": target_r['id'], "디지타스_출고일": out_date, "상태": "디지타스 출고"} if dest == "주식회사디지타스" else {"id": target_r['id'], "벤더_출고지": dest, "벤더_출고일": out_date, "상태": "벤더 출고 완료"}
-                    if dest == "주식회사디지타스": target_r['디지타스_출고일'] = out_date
-                    else: candidates.remove(target_r)
-                    updates.append(upd)
+                    # ID를 포함한 전체 행 복사 후 업데이트 (Upsert용)
+                    upd_row = target_r.copy()
+                    if dest == "주식회사디지타스":
+                        upd_row.update({"디지타스_출고일": out_date, "상태": "디지타스 출고"})
+                        target_r['디지타스_출고일'] = out_date
+                    else:
+                        upd_row.update({"벤더_출고지": dest, "벤더_출고일": out_date, "상태": "벤더 출고 완료"})
+                        candidates.remove(target_r)
+                    
+                    upsert_list.append(upd_row)
                     success_count += 1
                 
-                if len(updates) >= 150:
-                    for u in updates:
-                        id_val = u.pop('id')
-                        supabase.table("as_history").update(u).eq("id", id_val).execute()
-                    updates = []; ui_status.warning(f"⚡ 고속 DB 반영 중... ({i+1}/{len(as_out)} 건)")
+                # 3. 진짜 벌크 실행: 500건 단위 일괄 업데이트
+                if len(upsert_list) >= 500:
+                    supabase.table("as_history").upsert(upsert_list).execute()
+                    upsert_list = []
+                    ui_status.warning(f"⚡ 진짜 벌크 DB 반영 중... ({i+1}/{len(as_out)} 건)")
 
-            for u in updates:
-                id_val = u.pop('id')
-                supabase.table("as_history").update(u).eq("id", id_val).execute()
+            if upsert_list:
+                supabase.table("as_history").upsert(upsert_list).execute()
 
-            ui_status.success(f"✅ {success_count}건 반영 완료!")
+            ui_status.success(f"✅ {success_count}건 반영 완료! 이제 속도가 훨씬 빨라졌을 겁니다.")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 3] 리포트 생성 (기간 필터링)
+# [TAB 3] 리포트 생성
 with tab3:
     st.subheader("📈 기간별 분석 리포트")
     c1, c2 = st.columns(2)
-    with c1: s_d = st.date_input("시작일", datetime.now() - timedelta(days=30))
-    with c2: e_d = st.date_input("종료일", datetime.now())
+    with c1: s_d = st.date_input("조회 시작일", datetime.now() - timedelta(days=30))
+    with c2: e_d = st.date_input("조회 종료일", datetime.now())
 
     if st.button("📊 리포트 생성"):
         all_d, offset = [], 0
