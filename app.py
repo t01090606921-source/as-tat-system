@@ -13,7 +13,7 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (대상구분 포함 완결본)")
+st.title("📊 AS TAT 통합 관리 시스템 (AS 구분 반영본)")
 
 # [데이터 정제 함수]
 def sanitize_code(val):
@@ -57,19 +57,19 @@ with st.sidebar:
 # --- 3. 메인 기능 탭 ---
 tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입고", "📤 고속 출고(충돌 방지)", "📈 분석 리포트"])
 
-# [TAB 0] 마스터 관리
+# [TAB 0] 마스터 관리 (O열: AS 구분)
 with tab0:
-    st.subheader("📋 마스터 정보 등록 (O열: 대상구분)")
-    m_file = st.file_uploader("마스터 파일(O열 포함 필수)", type=['csv', 'xlsx'], key="m_v_final_full")
+    st.subheader("📋 마스터 정보 등록 (O열: AS 구분)")
+    m_file = st.file_uploader("마스터 파일(O열에 AS 구분 포함)", type=['csv', 'xlsx'], key="m_v_final_as_gb")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
-            # O열(index 14)을 '대상구분'으로 추출
+            # O열(index 14)을 'AS 구분'으로 저장
             st.session_state.master_lookup = {
                 sanitize_code(row.iloc[0]): {
                     "업체": str(row.iloc[5]).strip(), 
                     "분류": str(row.iloc[10]).strip(),
-                    "대상구분": str(row.iloc[14]).strip() if len(row) > 14 else "미지정"
+                    "AS구분": str(row.iloc[14]).strip() if len(row) > 14 else "미지정"
                 } for _, row in m_df.iterrows()
             }
             st.success(f"✅ 마스터 로드 완료 ({len(st.session_state.master_lookup):,}건)")
@@ -77,8 +77,8 @@ with tab0:
 
 # [TAB 1] 입고 처리
 with tab1:
-    st.subheader("📥 AS 입고 (대상구분 자동 매칭)")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final_full")
+    st.subheader("📥 AS 입고 (AS 구분 자동 매칭)")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final_as_gb")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
@@ -95,18 +95,18 @@ with tab1:
                         "압축코드": sanitize_code(row.iloc[7]), "자재번호": mat_no, "자재명": str(row.iloc[4]).strip(),
                         "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"),
-                        "대상구분": m_info.get("대상구분", "미등록"), 
+                        "대상구분": m_info.get("AS구분", "미등록"), # DB 컬럼명은 '대상구분'으로 유지(기존 스키마 호환)
                         "입고일": str(to_pure_date(row.iloc[1])), "상태": "출고 대기"
                     })
                     if len(recs) >= 500: supabase.table("as_history").insert(recs).execute(); recs = []
                 if recs: supabase.table("as_history").insert(recs).execute()
-                st.success("✅ 입고 완료 (대상구분 포함)")
+                st.success("✅ 입고 완료")
             except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리 (중복 ID 충돌 방지 로직 적용)
+# [TAB 2] 출고 처리
 with tab2:
-    st.subheader("📤 AS 출고 처리 (정밀 벌크 엔진)")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v_final_full")
+    st.subheader("📤 AS 출고 처리")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v_final_as_gb")
     if o_file and st.button("🚀 출고 반영 시작"):
         try:
             for enc in ['utf-8-sig', 'cp949']:
@@ -133,12 +133,10 @@ with tab2:
                 if len(res.data) < 1000: break
             
             success_count = 0
-            upsert_dict = {} # 중복 ID 충돌 방지를 위한 딕셔너리
-            
+            upsert_dict = {}
             for i, (idx, row) in enumerate(as_out.iterrows()):
                 code = sanitize_code(row.iloc[10]); out_date = to_pure_date(row.iloc[6]); dest = str(row.iloc[15]).strip()
                 target_r = None
-                
                 if code in db_data:
                     candidates = db_data[code]
                     for r in candidates:
@@ -152,23 +150,20 @@ with tab2:
                 
                 if target_r:
                     rid = target_r['id']
-                    # 동일 벌크 내 중복 ID가 있다면 기존 수정본을 가져와 누적 업데이트
                     upd_row = upsert_dict.get(rid, target_r.copy())
-                    
                     if dest == "주식회사디지타스":
                         upd_row.update({"디지타스_출고일": str(out_date), "상태": "디지타스 출고"})
                         target_r['디지타스_출고일'] = str(out_date)
                     else:
                         upd_row.update({"벤더_출고지": dest, "벤더_출고일": str(out_date), "상태": "벤더 출고 완료"})
                         candidates.remove(target_r)
-                    
                     upsert_dict[rid] = upd_row
                     success_count += 1
                 
                 if len(upsert_dict) >= 500:
                     supabase.table("as_history").upsert(list(upsert_dict.values())).execute()
                     upsert_dict = {}
-                    ui_status.warning(f"⚡ 중복 방지 벌크 반영 중... ({i+1}/{len(as_out)} 건)")
+                    ui_status.warning(f"⚡ 벌크 반영 중... ({i+1}/{len(as_out)} 건)")
 
             if upsert_dict:
                 supabase.table("as_history").upsert(list(upsert_dict.values())).execute()
@@ -176,9 +171,9 @@ with tab2:
             ui_status.success(f"✅ {success_count}건 반영 완료!")
         except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 3] 리포트 생성
+# [TAB 3] 리포트 생성 (최종 컬럼명: AS 구분)
 with tab3:
-    st.subheader("📈 분석 리포트 (대상구분 복구 완료)")
+    st.subheader("📈 분석 리포트")
     c1, c2 = st.columns(2)
     with c1: s_d = st.date_input("조회 시작일", datetime.now() - timedelta(days=30))
     with c2: e_d = st.date_input("조회 종료일", datetime.now())
@@ -195,20 +190,31 @@ with tab3:
         
         if all_d:
             df = pd.DataFrame(all_d)
+            
+            # DB 컬럼 '대상구분'을 리포트용 'AS 구분'으로 이름 변경
+            if '대상구분' in df.columns:
+                df = df.rename(columns={'대상구분': 'AS 구분'})
+            
+            # 컬럼 부재 시 방어 로직
+            if 'AS 구분' not in df.columns:
+                df['AS 구분'] = "미등록"
+            else:
+                df['AS 구분'] = df['AS 구분'].fillna("미등록")
+
             in_dt, dg_dt, vn_dt = pd.to_datetime(df['입고일'], errors='coerce'), pd.to_datetime(df['디지타스_출고일'], errors='coerce'), pd.to_datetime(df['벤더_출고일'], errors='coerce')
             df['TAT'] = (vn_dt - in_dt).dt.days
             df.loc[df['TAT'].isna(), 'TAT'] = (dg_dt - in_dt).dt.days
             
             df['입고일'], df['디지타스_출고일'], df['벤더_출고일'] = in_dt.dt.strftime('%Y-%m-%d'), dg_dt.dt.strftime('%Y-%m-%d').fillna("-"), vn_dt.dt.strftime('%Y-%m-%d').fillna("-")
             df['TAT'], df['벤더_출고지'] = df['TAT'].fillna("-"), df['벤더_출고지'].fillna("-")
-            df['대상구분'] = df['대상구분'].fillna("미등록")
             
-            # 최종 컬럼 순서
-            cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', '대상구분', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
+            # 최종 리포트 컬럼 구성 (AS 구분 반영)
+            cols = ['입고일', '자재번호', '자재명', '규격', '공급업체명', '압축코드', '분류구분', 'AS 구분', '디지타스_출고일', '벤더_출고지', '벤더_출고일', 'TAT', '상태']
+            available_cols = [c for c in cols if c in df.columns]
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
-                df[cols].to_excel(wr, index=False)
-            st.download_button("📥 대상구분 포함 최종 리포트 다운로드", output.getvalue(), f"AS_Report_Final_{s_d}.xlsx")
-            st.dataframe(df[cols].head(100))
+                df[available_cols].to_excel(wr, index=False)
+            st.download_button("📥 최종 리포트 다운로드", output.getvalue(), f"AS_Report_{s_d}.xlsx")
+            st.dataframe(df[available_cols].head(100))
         else: st.warning("데이터가 없습니다.")
