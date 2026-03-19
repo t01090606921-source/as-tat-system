@@ -14,7 +14,7 @@ except Exception as e:
     st.error("⚠️ Supabase 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (오류 추적 모드)")
+st.title("📊 AS TAT 통합 관리 시스템 (정밀 컬럼 매칭)")
 
 # [정제 함수]
 def ultimate_sanitize(val, length=100):
@@ -62,22 +62,22 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 전량 입�
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일 업로드", type=['csv', 'xlsx'], key="m_v_final")
+    m_file = st.file_uploader("마스터 파일 업로드(G열: 규격)", type=['csv', 'xlsx'], key="m_v_final")
     if m_file and st.button("🔄 마스터 데이터 로드"):
         m_df = smart_read_csv(m_file) if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
         st.session_state.master_lookup = {
             ultimate_sanitize(row.iloc[0]): {
                 "업체": str(row.iloc[5]).strip(),
-                "규격명": str(row.iloc[6]).strip(),
+                "규격": str(row.iloc[6]).strip(), # '규격명'에서 '규격'으로 수정
                 "분류": str(row.iloc[10]).strip(),
                 "AS구분": str(row.iloc[14]).strip() if len(row) > 14 else "미지정"
             } for _, row in m_df.iterrows()
         }
         st.success(f"✅ 마스터 {len(st.session_state.master_lookup):,}건 로드 완료")
 
-# [TAB 1] 전량 입고 (오류 원인 출력 강화)
+# [TAB 1] 전량 입고 (DB 컬럼명 '규격' 매칭)
 with tab1:
-    st.subheader("📥 AS 전량 입고")
+    st.subheader("📥 AS 전량 입고 (DB 동기화 버전)")
     c1, c2 = st.columns(2)
     with c1:
         date_idx = st.number_input("📅 입고일 열(A=1)", min_value=1, value=2) - 1
@@ -104,7 +104,7 @@ with tab1:
                     "압축코드": code,
                     "자재번호": mat_no,
                     "자재명": str(row.iloc[name_idx]).strip()[:200],
-                    "규격명": m_info.get("규격명", "미등록")[:200],
+                    "규격": m_info.get("규격", "미등록")[:200], # DB 컬럼명 '규격'에 맞춤
                     "공급업체명": m_info.get("업체", "미등록")[:100],
                     "분류구분": m_info.get("분류", "미등록")[:100],
                     "대상여부": m_info.get("AS구분", "미등록")[:50],
@@ -113,29 +113,19 @@ with tab1:
                 })
             
             prog = st.progress(0); status_txt = st.empty()
-            error_count = 0
-            
-            for i in range(0, len(recs), 50): # 더 안전하게 50건씩 전송
+            for i in range(0, len(recs), 50):
                 chunk = recs[i:i+50]
                 try:
-                    # upsert 시도
                     supabase.table("as_history").upsert(chunk, on_conflict="압축코드").execute()
                 except Exception as e:
-                    error_count += 1
-                    st.error(f"❌ {i}번 행 세트 전송 실패! 상세 원인: {e}")
-                    # 첫 번째 뭉텅이에서 에러나면 바로 중단해서 원인 파악 유도
-                    if i == 0:
-                        st.stop()
-                    continue
+                    st.error(f"❌ {i}번 행 세트 전송 실패! 원인: {e}")
+                    st.stop()
                 prog.progress(min((i+50)/len(recs), 1.0))
                 status_txt.text(f"⏳ 진행: {min(i+50, len(recs)):,} / {len(recs):,}")
             
-            if error_count == 0:
-                st.balloons(); st.success("✅ 모든 데이터가 정상 입고되었습니다.")
-            else:
-                st.warning(f"⚠️ 일부 데이터 전송 중 {error_count}번의 오류 세트가 발생했습니다.")
+            st.balloons(); st.success("✅ 모든 데이터가 '규격' 컬럼으로 정상 입고되었습니다.")
 
-# [TAB 2, 3 로직 동일하게 유지]
+# [TAB 2, 3 로직 유지]
 with tab2:
     st.subheader("📤 AS 고속 출고 매칭")
     o_file = st.file_uploader("출고 CSV", type=['csv'], key="o_v_final")
@@ -173,7 +163,8 @@ with tab3:
             all_d.extend(res.data); offset += 1000
         if all_d:
             df = pd.DataFrame(all_d).drop_duplicates(subset=['압축코드'], keep='last')
-            target_cols = ["입고일", "자재번호", "자재명", "규격명", "공급업체명", "분류구분", "대상여부", "압축코드", "디지타스_출고일", "벤더_출고일", "벤더_출고지", "상태"]
+            # 리포트 출력 시에도 '규격' 컬럼 사용
+            target_cols = ["입고일", "자재번호", "자재명", "규격", "공급업체명", "분류구분", "대상여부", "압축코드", "디지타스_출고일", "벤더_출고일", "벤더_출고지", "상태"]
             df = df[[c for c in target_cols if c in df.columns]]
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
