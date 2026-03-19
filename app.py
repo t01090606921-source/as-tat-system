@@ -15,7 +15,7 @@ except Exception as e:
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
 st.title("📊 AS TAT 통합 관리 시스템")
 
-# [데이터 정제] 원본 보존
+# [데이터 정제] 양끝 공백만 제거 (중간 공백/기호는 유지하여 원본 보존)
 def preserve_raw(val):
     if pd.isna(val) or str(val).strip() == "": return ""
     return str(val).strip()
@@ -34,7 +34,7 @@ def smart_read_csv(file):
         except: continue
     raise Exception("CSV 인코딩 오류")
 
-# --- 2. 사이드바 (실시간 DB 상태) ---
+# --- 2. 사이드바 (실시간 DB 상태 감시) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어 센터")
     if st.button("🔍 DB 데이터 개수 확인", use_container_width=True):
@@ -42,7 +42,8 @@ with st.sidebar:
         st.metric("DB 내 총 데이터", f"{res.count if res.count is not None else 0:,} 건")
     
     st.divider()
-    if st.button("💣 DB 전체 초기화", type="primary", use_container_width=True):
+    st.warning("⚠️ 중복 방지를 위해 입고 전 초기화를 권장합니다.")
+    if st.button("💣 DB 전체 데이터 초기화", type="primary", use_container_width=True):
         try:
             status = st.empty()
             while True:
@@ -50,40 +51,33 @@ with st.sidebar:
                 ids = [r['id'] for r in fetch.data]
                 if not ids: break
                 supabase.table("as_history").delete().in_("id", ids).execute()
-                status.text("🗑️ 삭제 중...")
-            st.success("✅ 초기화 완료"); st.rerun()
+                status.text("🗑️ 이전 데이터 소거 중...")
+            st.success("✅ 초기화 완료"); time.sleep(1); st.rerun()
         except Exception as e: st.error(f"오류: {e}")
 
 # --- 3. 메인 기능 탭 ---
-tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 데이터 전량 입고", "📤 고속 출고 매칭", "📈 리포트"])
+tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 전량 입고(검수)", "📤 고속 출고 매칭", "📈 리포트"])
 
-# [TAB 0] 마스터 관리 (업체 정보 매핑용)
+# [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    st.info("자재번호별 업체명, 분류 정보를 불러옵니다.")
-    m_file = st.file_uploader("마스터 엑셀/CSV 업로드", type=['csv', 'xlsx'], key="master_up")
-    
+    m_file = st.file_uploader("마스터 파일 업로드", type=['csv', 'xlsx'], key="master_up")
     if m_file and st.button("🔄 마스터 데이터 로드"):
         try:
-            if m_file.name.endswith('.csv'):
-                m_df = smart_read_csv(m_file)
-            else:
-                m_df = pd.read_excel(m_file).fillna("")
-            
-            # 자재번호(A열) 기준으로 정보 매핑 (열 순서는 사용자 환경에 맞춰 조정 필요)
+            m_df = smart_read_csv(m_file) if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
             st.session_state.master_lookup = {
                 preserve_raw(row.iloc[0]): {
-                    "업체": preserve_raw(row.iloc[5]), # F열: 업체명
-                    "분류": preserve_raw(row.iloc[10]), # K열: 분류
+                    "업체": preserve_raw(row.iloc[5]),
+                    "분류": preserve_raw(row.iloc[10]),
                     "AS구분": preserve_raw(row.iloc[14]) if len(row) > 14 else "미지정"
                 } for _, row in m_df.iterrows()
             }
             st.success(f"✅ 마스터 {len(st.session_state.master_lookup):,}건 로드 완료")
-        except Exception as e: st.error(f"마스터 로드 실패: {e}")
+        except Exception as e: st.error(f"마스터 오류: {e}")
 
-# [TAB 1] 전량 입고 (마스터 정보 결합)
+# [TAB 1] 전량 입고 (중복 검수 로직 강화)
 with tab1:
-    st.subheader("📥 AS 전량 입고 (16,995건 대응)")
+    st.subheader("📥 AS 전량 입고 (파일 내 중복 제거 포함)")
     col1, col2 = st.columns(2)
     with col1:
         in_date_col = st.number_input("📅 입고일 열(A=1)", min_value=1, value=2) - 1
@@ -94,15 +88,23 @@ with tab1:
 
     i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_main")
     
-    if i_file and st.button("🚀 입고 시작 (마스터 결합)", use_container_width=True):
+    if i_file and st.button("🚀 중복 검수 후 입고 시작", use_container_width=True):
         if "master_lookup" not in st.session_state:
-            st.error("⚠️ [마스터 관리] 탭에서 마스터 파일을 먼저 로드해주세요.")
+            st.error("⚠️ [마스터 관리] 탭에서 마스터를 먼저 로드하세요.")
         else:
             try:
-                df = smart_read_csv(i_file)
+                raw_df = smart_read_csv(i_file)
+                # 1단계: 파일 내 중복 제거 (압축코드 기준 마지막 행 유지)
+                raw_df['tmp_key'] = raw_df.iloc[:, in_code_col].apply(preserve_raw)
+                clean_df = raw_df.drop_duplicates(subset=['tmp_key'], keep='last')
+                
+                diff = len(raw_df) - len(clean_df)
+                if diff > 0:
+                    st.warning(f"⚠️ 파일 내 중복 데이터 {diff:,}건이 발견되어 자동으로 제외되었습니다.")
+                
                 recs = []
-                for _, row in df.iterrows():
-                    code = preserve_raw(row.iloc[in_code_col])
+                for _, row in clean_df.iterrows():
+                    code = row['tmp_key']
                     if not code: continue
                     
                     mat_no = preserve_raw(row.iloc[in_mat_col])
@@ -120,8 +122,7 @@ with tab1:
                     })
                 
                 total = len(recs)
-                prog_bar = st.progress(0)
-                status_msg = st.empty()
+                prog_bar = st.progress(0); status_msg = st.empty()
                 success_count = 0
                 
                 for i in range(0, total, 200):
@@ -143,7 +144,6 @@ with tab2:
             df_out = smart_read_csv(o_file)
             df_out['match_key'] = df_out.iloc[:, 10].apply(preserve_raw)
             
-            # DB 로드
             db_data, offset = [], 0
             while True:
                 res = supabase.table("as_history").select("id, 압축코드").range(offset, offset+1000).execute()
