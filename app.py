@@ -20,6 +20,7 @@ st.title("📊 AS TAT 통합 관리 시스템 (최종 완결본)")
 # [데이터 정제 함수] - 특수문자/공백 제거로 매칭률 극대화
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
+    # 숫자와 영문자만 남기고 모두 제거 (눈에 안 보이는 유령문자 차단)
     return re.sub(r'[^a-zA-Z0-9]', '', str(val)).upper().strip()
 
 def to_pure_date(val):
@@ -27,6 +28,16 @@ def to_pure_date(val):
         if pd.isna(val) or str(val).strip() == "": return None
         return pd.to_datetime(val).date()
     except: return None
+
+# [파일 읽기 함수] - 인코딩 오류(CP949/UTF-8) 자동 해결
+def smart_read_csv(file):
+    for enc in ['utf-8-sig', 'cp949', 'utf-8']:
+        try:
+            file.seek(0)
+            return pd.read_csv(file, encoding=enc).fillna("")
+        except UnicodeDecodeError:
+            continue
+    raise Exception("파일 인코딩을 인식할 수 없습니다. CSV 파일을 확인해주세요.")
 
 # --- 2. 사이드바 (DB 관리 및 분할 삭제) ---
 with st.sidebar:
@@ -54,7 +65,7 @@ with st.sidebar:
                         ids = [r['id'] for r in fetch.data]
                         if not ids: break
                         supabase.table("as_history").delete().in_("id", ids).execute()
-                        msg.warning(f"🗑️ 데이터 소거 중... (ID {len(ids)}개 처리)")
+                        msg.warning(f"🗑️ 데이터 소거 중... (남은 데이터 확인 중)")
                         time.sleep(0.2)
                     st.session_state.delete_confirm = False
                     st.success("✅ 초기화 완료"); time.sleep(1); st.rerun()
@@ -73,7 +84,11 @@ with tab0:
     m_file = st.file_uploader("마스터 파일(xlsx/csv)", type=['csv', 'xlsx'], key="master_up")
     if m_file and st.button("🔄 마스터 로드"):
         try:
-            m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
+            if m_file.name.endswith('.csv'):
+                m_df = smart_read_csv(m_file)
+            else:
+                m_df = pd.read_excel(m_file).fillna("")
+            
             st.session_state.master_lookup = {
                 sanitize_code(row.iloc[0]): {
                     "업체": str(row.iloc[5]).strip(), 
@@ -92,8 +107,9 @@ with tab1:
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
             try:
-                i_df = pd.read_csv(i_file, encoding='cp949').fillna("")
-                as_in = i_df[i_df.iloc[:, 7].astype(str).str.contains("A/S철거|AS철거", na=False)].copy()
+                i_df = smart_read_csv(i_file)
+                # 'A/S' 혹은 'AS'가 포함된 행 필터링
+                as_in = i_df[i_df.iloc[:, 7].astype(str).str.contains("A/S|AS", na=False)].copy()
                 as_in['clean_code'] = as_in.iloc[:, 7].apply(sanitize_code)
                 as_in = as_in.drop_duplicates(subset=['clean_code'])
                 
@@ -111,7 +127,7 @@ with tab1:
                     })
                 
                 for i in range(0, len(recs), 200):
-                    # 압축코드가 같으면 덮어쓰기하여 중복 행 발생을 원천 차단
+                    # upsert: 압축코드가 같으면 덮어쓰기하여 중복 방지
                     supabase.table("as_history").upsert(recs[i:i+200], on_conflict="압축코드").execute()
                     time.sleep(0.3)
                 st.success(f"✅ {len(recs)}건 처리 완료")
@@ -123,7 +139,7 @@ with tab2:
     o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="out_up")
     if o_file and st.button("🚀 출고 시작"):
         try:
-            df_out = pd.read_csv(o_file, encoding='cp949').fillna("")
+            df_out = smart_read_csv(o_file)
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS|A/S|카톤', case=False)].copy()
             
             progress = st.progress(0); status_text = st.empty()
@@ -134,7 +150,7 @@ with tab2:
                 out_date = to_pure_date(row.iloc[6])
                 dest = str(row.iloc[15]).strip()
                 
-                # 메모리 리스트가 아닌 DB에 직접 물어봄 (누락 방지 핵심)
+                # DB 직접 조회를 통해 정확한 대상 매칭
                 res = supabase.table("as_history").select("*").eq("압축코드", code).neq("상태", "벤더 출고 완료").execute()
                 
                 if res.data:
