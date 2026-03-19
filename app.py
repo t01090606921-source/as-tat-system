@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import io
+import time
 from datetime import datetime, timedelta
 
 # --- 1. Supabase 접속 설정 ---
@@ -13,7 +14,7 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (대상여부 명칭 반영본)")
+st.title("📊 AS TAT 통합 관리 시스템 (최종 완결본)")
 
 # [데이터 정제 함수]
 def sanitize_code(val):
@@ -60,7 +61,7 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 고속 입�
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록 (O열: AS 구분)")
-    m_file = st.file_uploader("마스터 파일(O열 포함)", type=['csv', 'xlsx'], key="m_v_final_target_yn")
+    m_file = st.file_uploader("마스터 파일(O열 포함)", type=['csv', 'xlsx'], key="master_final")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
@@ -77,7 +78,7 @@ with tab0:
 # [TAB 1] 입고 처리
 with tab1:
     st.subheader("📥 AS 입고 진행")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_v_final_target_yn")
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_final")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
@@ -94,18 +95,20 @@ with tab1:
                         "압축코드": sanitize_code(row.iloc[7]), "자재번호": mat_no, "자재명": str(row.iloc[4]).strip(),
                         "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"),
-                        "대상여부": m_info.get("AS구분", "미등록"), # DB 컬럼명 반영
+                        "대상여부": m_info.get("AS구분", "미등록"),
                         "입고일": str(to_pure_date(row.iloc[1])), "상태": "출고 대기"
                     })
-                    if len(recs) >= 500: supabase.table("as_history").insert(recs).execute(); recs = []
+                    if len(recs) >= 200:
+                        supabase.table("as_history").insert(recs).execute()
+                        recs = []; time.sleep(0.3)
                 if recs: supabase.table("as_history").insert(recs).execute()
-                st.success("✅ 입고 완료 (대상여부 데이터 포함)")
-            except Exception as e: st.error(f"DB 오류: {e}\n\n💡 Supabase 테이블에 '대상여부' 컬럼이 있는지 확인해주세요.")
+                st.success("✅ 입고 완료 (대상여부 포함)")
+            except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 2] 출고 처리
+# [TAB 2] 출고 처리 (안정성 강화 버전)
 with tab2:
     st.subheader("📤 AS 출고 처리")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_v_final_target_yn")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="out_final")
     if o_file and st.button("🚀 출고 반영 시작"):
         try:
             for enc in ['utf-8-sig', 'cp949']:
@@ -130,6 +133,7 @@ with tab2:
                     db_data[c].append(r)
                 offset += len(res.data)
                 if len(res.data) < 1000: break
+                time.sleep(0.2)
             
             success_count = 0
             upsert_dict = {}
@@ -159,10 +163,11 @@ with tab2:
                     upsert_dict[rid] = upd_row
                     success_count += 1
                 
-                if len(upsert_dict) >= 500:
+                if len(upsert_dict) >= 200:
                     supabase.table("as_history").upsert(list(upsert_dict.values())).execute()
                     upsert_dict = {}
-                    ui_status.warning(f"⚡ 벌크 반영 중... ({i+1}/{len(as_out)} 건)")
+                    ui_status.warning(f"⚡ 분할 반영 중... ({i+1}/{len(as_out)} 건)")
+                    time.sleep(0.8)
 
             if upsert_dict:
                 supabase.table("as_history").upsert(list(upsert_dict.values())).execute()
@@ -185,13 +190,11 @@ with tab3:
             all_d.extend(res.data); offset += len(res.data)
             status.info(f"📥 추출 중... ({offset:,}건)")
             if len(res.data) < 1000: break
+            time.sleep(0.2)
         
         if all_d:
             df = pd.DataFrame(all_d)
-            # DB 컬럼 '대상여부'를 리포트용 'AS 구분'으로 매핑
-            if '대상여부' in df.columns:
-                df = df.rename(columns={'대상여부': 'AS 구분'})
-            
+            if '대상여부' in df.columns: df = df.rename(columns={'대상여부': 'AS 구분'})
             if 'AS 구분' not in df.columns: df['AS 구분'] = "미등록"
             else: df['AS 구분'] = df['AS 구분'].fillna("미등록")
 
