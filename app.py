@@ -15,12 +15,11 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (무결성 강화 완결본)")
+st.title("📊 AS TAT 통합 관리 시스템 (최종 완결본)")
 
-# [데이터 정제 함수] - 눈에 안 보이는 특수문자까지 제거
+# [데이터 정제 함수] - 특수문자/공백 제거로 매칭률 극대화
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
-    # 숫자와 영문자만 남기고 모두 제거 (공백, 유령문자 차단)
     return re.sub(r'[^a-zA-Z0-9]', '', str(val)).upper().strip()
 
 def to_pure_date(val):
@@ -29,7 +28,7 @@ def to_pure_date(val):
         return pd.to_datetime(val).date()
     except: return None
 
-# --- 2. 사이드바 (DB 관리) ---
+# --- 2. 사이드바 (DB 관리 및 분할 삭제) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어")
     if st.button("🔍 DB 상태 새로고침", use_container_width=True):
@@ -43,12 +42,24 @@ with st.sidebar:
         if st.button("💣 데이터 전체 삭제", use_container_width=True, type="primary"):
             st.session_state.delete_confirm = True; st.rerun()
     else:
-        st.warning("정말 모든 데이터를 삭제하시겠습니까?")
+        st.warning("⚠️ 모든 데이터를 삭제하시겠습니까?")
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ 확정", use_container_width=True):
-                supabase.table("as_history").delete().neq("id", -1).execute()
-                st.session_state.delete_confirm = False; st.success("초기화 완료"); st.rerun()
+                try:
+                    msg = st.empty()
+                    while True:
+                        # APIError 방지를 위해 500개씩 끊어서 삭제
+                        fetch = supabase.table("as_history").select("id").limit(500).execute()
+                        ids = [r['id'] for r in fetch.data]
+                        if not ids: break
+                        supabase.table("as_history").delete().in_("id", ids).execute()
+                        msg.warning(f"🗑️ 데이터 소거 중... (ID {len(ids)}개 처리)")
+                        time.sleep(0.2)
+                    st.session_state.delete_confirm = False
+                    st.success("✅ 초기화 완료"); time.sleep(1); st.rerun()
+                except Exception as e:
+                    st.error(f"삭제 오류: {e}")
         with c2:
             if st.button("❌ 취소", use_container_width=True):
                 st.session_state.delete_confirm = False; st.rerun()
@@ -59,7 +70,7 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 정밀 입�
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일(xlsx/csv)", type=['csv', 'xlsx'])
+    m_file = st.file_uploader("마스터 파일(xlsx/csv)", type=['csv', 'xlsx'], key="master_up")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = pd.read_csv(m_file, encoding='cp949').fillna("") if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
@@ -73,10 +84,10 @@ with tab0:
             st.success(f"✅ 마스터 {len(st.session_state.master_lookup):,}건 로드 완료")
         except Exception as e: st.error(f"마스터 로드 실패: {e}")
 
-# [TAB 1] 정밀 입고 (중복 차단)
+# [TAB 1] 정밀 입고 (중복 차단 및 덮어쓰기)
 with tab1:
     st.subheader("📥 AS 입고 (압축코드 기준 중복 방지)")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'])
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_up")
     if i_file and st.button("🚀 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
@@ -100,16 +111,16 @@ with tab1:
                     })
                 
                 for i in range(0, len(recs), 200):
-                    # on_conflict를 통해 중복된 압축코드는 자동으로 덮어쓰기(Update)
+                    # 압축코드가 같으면 덮어쓰기하여 중복 행 발생을 원천 차단
                     supabase.table("as_history").upsert(recs[i:i+200], on_conflict="압축코드").execute()
                     time.sleep(0.3)
-                st.success(f"✅ {len(recs)}건 처리 완료 (중복은 자동 갱신됨)")
+                st.success(f"✅ {len(recs)}건 처리 완료")
             except Exception as e: st.error(f"입고 오류: {e}")
 
-# [TAB 2] 정밀 출고 (누락 차단)
+# [TAB 2] 정밀 출고 (실시간 DB 매칭으로 누락 방지)
 with tab2:
-    st.subheader("📤 AS 출고 (DB 실시간 매칭)")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'])
+    st.subheader("📤 AS 출고 (DB 실시간 조회)")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="out_up")
     if o_file and st.button("🚀 출고 시작"):
         try:
             df_out = pd.read_csv(o_file, encoding='cp949').fillna("")
@@ -123,7 +134,7 @@ with tab2:
                 out_date = to_pure_date(row.iloc[6])
                 dest = str(row.iloc[15]).strip()
                 
-                # DB에서 해당 압축코드를 가진 '출고 대기' 혹은 '디지타스 출고' 상태인 건 조회
+                # 메모리 리스트가 아닌 DB에 직접 물어봄 (누락 방지 핵심)
                 res = supabase.table("as_history").select("*").eq("압축코드", code).neq("상태", "벤더 출고 완료").execute()
                 
                 if res.data:
@@ -138,7 +149,7 @@ with tab2:
                     success_count += 1
                 
                 progress.progress((idx + 1) / len(as_out))
-                status_text.text(f"진행 중: {idx+1}/{len(as_out)} (성공: {success_count})")
+                status_text.text(f"처리 중: {idx+1}/{len(as_out)} (성공: {success_count})")
             
             st.success(f"✅ 최종 {success_count}건 출고 반영 완료!")
         except Exception as e: st.error(f"출고 오류: {e}")
@@ -164,19 +175,15 @@ with tab3:
             
             if all_d:
                 df = pd.DataFrame(all_d)
-                # 컬럼명 정리
                 if '대상여부' in df.columns: df = df.rename(columns={'대상여부': 'AS 구분'})
                 
-                # TAT 계산 로직
                 in_dt = pd.to_datetime(df['입고일'], errors='coerce')
                 dg_dt = pd.to_datetime(df['디지타스_출고일'], errors='coerce')
                 vn_dt = pd.to_datetime(df['벤더_출고일'], errors='coerce')
                 
-                # 최종 출고일 기준 TAT 산출 (벤더 출고 우선, 없으면 디지타스 출고 기준)
                 df['TAT'] = (vn_dt - in_dt).dt.days
                 df.loc[df['TAT'].isna(), 'TAT'] = (dg_dt - in_dt).dt.days
                 
-                # 포맷 정리
                 df['입고일'] = in_dt.dt.strftime('%Y-%m-%d')
                 df['디지타스_출고일'] = dg_dt.dt.strftime('%Y-%m-%d').fillna("-")
                 df['벤더_출고일'] = vn_dt.dt.strftime('%Y-%m-%d').fillna("-")
@@ -191,8 +198,8 @@ with tab3:
                 with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                     df[available_cols].to_excel(wr, index=False)
                 
-                st.download_button("📥 최종 리포트 다운로드", output.getvalue(), f"AS_TAT_Report_{datetime.now().strftime('%Y%m%d')}.xlsx")
+                st.download_button("📥 최종 리포트 다운로드", output.getvalue(), f"AS_Report_{datetime.now().strftime('%Y%m%d')}.xlsx")
                 st.dataframe(df[available_cols].head(100))
             else:
-                st.warning("해당 기간에 데이터가 없습니다.")
-        except Exception as e: st.error(f"리포트 생성 오류: {e}")
+                st.warning("데이터가 없습니다.")
+        except Exception as e: st.error(f"리포트 생성 실패: {e}")
