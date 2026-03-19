@@ -15,12 +15,12 @@ except Exception as e:
     st.error("⚠️ Supabase 접속 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (DB 제약조건 대응 버전)")
+st.title("📊 AS TAT 통합 관리 시스템 (전체 데이터 입고 버전)")
 
-# [데이터 정제 함수]
+# [데이터 정제 함수] - 공백만 제거하여 매칭률 확보
 def sanitize_code(val):
     if pd.isna(val) or str(val).strip() == "": return ""
-    return re.sub(r'[^a-zA-Z0-9]', '', str(val)).upper().strip()
+    return str(val).replace(" ", "").upper().strip()
 
 def to_pure_date(val):
     try:
@@ -28,17 +28,16 @@ def to_pure_date(val):
         return pd.to_datetime(val).date()
     except: return None
 
-# [파일 읽기 함수]
+# [파일 읽기 함수] - 인코딩 오류 자동 해결
 def smart_read_csv(file):
     for enc in ['utf-8-sig', 'cp949', 'utf-8']:
         try:
             file.seek(0)
             return pd.read_csv(file, encoding=enc).fillna("")
-        except UnicodeDecodeError:
-            continue
+        except UnicodeDecodeError: continue
     raise Exception("파일 인코딩을 인식할 수 없습니다.")
 
-# --- 2. 사이드바 (DB 관리) ---
+# --- 2. 사이드바 (DB 관리 및 분할 삭제) ---
 with st.sidebar:
     st.header("⚙️ 시스템 제어")
     if st.button("🔍 DB 상태 새로고침", use_container_width=True):
@@ -71,12 +70,12 @@ with st.sidebar:
                 st.session_state.delete_confirm = False; st.rerun()
 
 # --- 3. 메인 기능 탭 ---
-tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 정밀 입고", "📤 정밀 출고", "📈 분석 리포트"])
+tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 무조건 입고", "📤 정밀 출고", "📈 분석 리포트"])
 
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일", type=['csv', 'xlsx'], key="master_up")
+    m_file = st.file_uploader("마스터 파일", type=['csv', 'xlsx'], key="m_up")
     if m_file and st.button("🔄 마스터 로드"):
         try:
             m_df = smart_read_csv(m_file) if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
@@ -87,51 +86,60 @@ with tab0:
                 } for _, row in m_df.iterrows()
             }
             st.success(f"✅ 마스터 로드 완료")
-        except Exception as e: st.error(f"마스터 로드 실패: {e}")
+        except Exception as e: st.error(f"오류: {e}")
 
-# [TAB 1] 정밀 입고
+# [TAB 1] 입고 (필터링 제거)
 with tab1:
-    st.subheader("📥 AS 입고")
-    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="in_up")
-    if i_file and st.button("🚀 입고 시작"):
+    st.subheader("📥 AS 입고 (전체 행 처리)")
+    st.info("💡 H열(8번)에 'AS' 글자가 없어도 모든 데이터를 읽어옵니다.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        date_idx = st.number_input("📅 입고일 열(A=1)", min_value=1, value=2) - 1
+        code_idx = st.number_input("🔑 압축코드 열(A=1)", min_value=1, value=8) - 1
+    with col2:
+        mat_idx = st.number_input("📦 자재번호 열(A=1)", min_value=1, value=4) - 1
+        name_idx = st.number_input("📝 자재명 열(A=1)", min_value=1, value=5) - 1
+
+    i_file = st.file_uploader("입고 CSV 업로드", type=['csv'], key="i_up")
+    if i_file and st.button("🚀 16,995건 전량 입고 시작"):
         if "master_lookup" not in st.session_state: st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
             try:
                 i_df = smart_read_csv(i_file)
-                as_in = i_df[i_df.iloc[:, 7].astype(str).str.contains("A/S|AS", na=False)].copy()
-                as_in['clean_code'] = as_in.iloc[:, 7].apply(sanitize_code)
-                as_in = as_in.drop_duplicates(subset=['clean_code'])
-                
                 recs = []
-                for _, row in as_in.iterrows():
-                    code = row['clean_code']
-                    mat_no = sanitize_code(row.iloc[3])
+                for _, row in i_df.iterrows():
+                    code = sanitize_code(row.iloc[code_idx])
+                    if not code: continue # 압축코드가 아예 없는 행만 제외
+                    
+                    mat_no = sanitize_code(row.iloc[mat_idx])
                     m_info = st.session_state.master_lookup.get(mat_no, {})
                     recs.append({
-                        "압축코드": code, "자재번호": mat_no, "자재명": str(row.iloc[4]).strip(),
-                        "규격": str(row.iloc[5]).strip(), "공급업체명": m_info.get("업체", "미등록"),
+                        "압축코드": code, "자재번호": mat_no, "자재명": str(row.iloc[name_idx]).strip(),
+                        "규격": str(row.iloc[5]).strip() if len(row) > 5 else "",
+                        "공급업체명": m_info.get("업체", "미등록"),
                         "분류구분": m_info.get("분류", "수리대상"), "대상여부": m_info.get("AS구분", "미등록"),
-                        "입고일": str(to_pure_date(row.iloc[1])), "상태": "출고 대기"
+                        "입고일": str(to_pure_date(row.iloc[date_idx])), "상태": "출고 대기"
                     })
                 
+                status_msg = st.empty()
                 for i in range(0, len(recs), 200):
                     supabase.table("as_history").upsert(recs[i:i+200], on_conflict="압축코드").execute()
-                    time.sleep(0.2)
-                st.success(f"✅ {len(recs)}건 처리 완료")
-            except Exception as e:
-                st.error(f"입고 오류: {e}")
-                st.info("💡 위 오류가 'ON CONFLICT' 관련이라면, Supabase 대시보드에서 '압축코드' 컬럼을 'Unique'로 설정해야 합니다.")
+                    status_msg.info(f"⏳ 진행 중: {min(i+200, len(recs))}/{len(recs)}")
+                st.success(f"✅ 총 {len(recs):,}건 입고 완료!")
+            except Exception as e: st.error(f"입고 오류: {e}")
 
-# [TAB 2] 정밀 출고
+# [TAB 2] 출고 (DB 실시간 매칭)
 with tab2:
-    st.subheader("📤 AS 출고")
-    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="out_up")
+    st.subheader("📤 AS 출고 (실시간 매칭)")
+    o_file = st.file_uploader("출고 CSV 업로드", type=['csv'], key="o_up")
     if o_file and st.button("🚀 출고 시작"):
         try:
             df_out = smart_read_csv(o_file)
+            # 출고는 기존처럼 'AS카톤' 등 키워드가 있는 행만 골라냅니다.
             as_out = df_out[df_out.iloc[:, 3].astype(str).str.contains('AS|A/S|카톤', case=False)].copy()
-            progress = st.progress(0); status_text = st.empty()
-            success_count = 0
+            
+            prog = st.progress(0); stat = st.empty(); success_count = 0
             for idx, row in as_out.iterrows():
                 code = sanitize_code(row.iloc[10]); out_date = to_pure_date(row.iloc[6]); dest = str(row.iloc[15]).strip()
                 res = supabase.table("as_history").select("*").eq("압축코드", code).neq("상태", "벤더 출고 완료").execute()
@@ -145,12 +153,12 @@ with tab2:
                     }
                     supabase.table("as_history").update(update_data).eq("id", target['id']).execute()
                     success_count += 1
-                progress.progress((idx + 1) / len(as_out))
-                status_text.text(f"처리 중: {idx+1}/{len(as_out)} (성공: {success_count})")
+                prog.progress((idx + 1) / len(as_out))
+                stat.text(f"처리 중: {idx+1}/{len(as_out)} (성공: {success_count})")
             st.success(f"✅ 최종 {success_count}건 반영 완료!")
         except Exception as e: st.error(f"출고 오류: {e}")
 
-# [TAB 3] 리포트 생성
+# [TAB 3] 리포트
 with tab3:
     st.subheader("📈 분석 리포트")
     c1, c2 = st.columns(2)
@@ -175,7 +183,7 @@ with tab3:
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                     df[cols].to_excel(wr, index=False)
-                st.download_button("📥 다운로드", output.getvalue(), "AS_Report.xlsx")
+                st.download_button("📥 다운로드", output.getvalue(), "AS_TAT_Report.xlsx")
                 st.dataframe(df[cols].head(100))
             else: st.warning("데이터가 없습니다.")
         except Exception as e: st.error(f"리포트 오류: {e}")
