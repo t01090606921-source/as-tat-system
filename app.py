@@ -14,14 +14,14 @@ except Exception as e:
     st.error("⚠️ Supabase 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (출고 누락 방지 버전)")
+st.title("📊 AS TAT 통합 관리 시스템 (중복 입고 대응 버전)")
 
-# [핵심 함수] 매칭률을 극대화하는 정밀 정제 (영문, 숫자, 하이픈만 남김)
+# [정밀 정제 함수] 매칭률 극대화
 def ultimate_sanitize(val, length=100):
     if pd.isna(val) or str(val).strip() == "": return ""
-    s = str(val).strip().upper()  # 무조건 대문자
-    s = "".join(s.split())        # 모든 공백 제거
-    s = re.sub(r'[^A-Z0-9-]', '', s) # 영문, 숫자, 하이픈 외 모든 특수문자/한글 제거
+    s = str(val).strip().upper()
+    s = "".join(s.split())
+    s = re.sub(r'[^A-Z0-9-]', '', s)
     return s[:length]
 
 def to_pure_date(val):
@@ -75,9 +75,9 @@ with tab0:
         }
         st.success(f"✅ 마스터 {len(st.session_state.master_lookup):,}건 로드 완료")
 
-# [TAB 1] 전량 입고
+# [TAB 1] 전량 입고 (중복 입고 허용)
 with tab1:
-    st.subheader("📥 AS 전량 입고")
+    st.subheader("📥 AS 전량 입고 (이력 보존 모드)")
     c1, c2 = st.columns(2)
     with c1:
         date_idx = st.number_input("📅 입고일 열(A=1)", min_value=1, value=2) - 1
@@ -92,73 +92,82 @@ with tab1:
             st.error("⚠️ 마스터를 먼저 로드하세요.")
         else:
             df = smart_read_csv(i_file)
-            df['clean_key'] = df.iloc[:, code_idx].apply(lambda x: ultimate_sanitize(x, 100))
-            clean_df = df[df['clean_key'] != ""].drop_duplicates(subset=['clean_key'], keep='last')
-            
             recs = []
-            for _, row in clean_df.iterrows():
-                code = row['clean_key']
-                mat_no = ultimate_sanitize(row.iloc[mat_idx], 100)
+            for _, row in df.iterrows():
+                code = ultimate_sanitize(row.iloc[code_idx])
+                i_date = to_pure_date(row.iloc[date_idx])
+                if not code or not i_date: continue
+                
+                mat_no = ultimate_sanitize(row.iloc[mat_idx])
                 m_info = st.session_state.master_lookup.get(mat_no, {})
                 recs.append({
-                    "압축코드": code, "자재번호": mat_no,
+                    "압축코드": code, "입고일": i_date, "자재번호": mat_no,
                     "자재명": str(row.iloc[name_idx]).strip()[:200],
                     "규격": m_info.get("규격", "미등록")[:200],
                     "공급업체명": m_info.get("업체", "미등록")[:100],
                     "분류구분": m_info.get("분류", "미등록")[:100],
                     "대상여부": m_info.get("AS구분", "미등록")[:50],
-                    "입고일": to_pure_date(row.iloc[date_idx]), "상태": "출고 대기"
+                    "상태": "출고 대기"
                 })
             
-            prog = st.progress(0); status_txt = st.empty()
+            prog = st.progress(0)
+            # 중복 입고를 허용하기 위해 on_conflict를 사용하지 않거나, id 기반으로 insert
             for i in range(0, len(recs), 50):
-                chunk = recs[i:i+50]
-                supabase.table("as_history").upsert(chunk, on_conflict="압축코드").execute()
+                supabase.table("as_history").insert(recs[i:i+50]).execute()
                 prog.progress(min((i+50)/len(recs), 1.0))
-            st.success("✅ 입고 완료!")
+            st.success(f"✅ 총 {len(recs):,}건의 입고 이력이 생성되었습니다.")
 
-# [TAB 2] 출고 매칭 (누락 원인 추적 강화)
+# [TAB 2] 출고 매칭 (정밀 날짜 매칭 알고리즘)
 with tab2:
-    st.subheader("📤 AS 고속 출고 매칭 (정밀 모드)")
+    st.subheader("📤 AS 고속 출고 매칭 (날짜 기반 정밀 매칭)")
     o_file = st.file_uploader("출고 CSV", type=['csv'], key="o_v_final")
     if o_file and st.button("🚀 매칭 시작"):
         try:
             df_out = smart_read_csv(o_file)
-            df_out['match_key'] = df_out.iloc[:, 10].apply(lambda x: ultimate_sanitize(x, 100))
+            df_out['match_key'] = df_out.iloc[:, 10].apply(ultimate_sanitize)
+            df_out['out_date'] = df_out.iloc[:, 6].apply(to_pure_date)
             
-            # DB 데이터 로드
-            db_data, offset = [], 0
+            # 1. DB 전체 데이터 로드
+            db_res, offset = [], 0
             while True:
-                res = supabase.table("as_history").select("id, 압축코드").range(offset, offset+999).execute()
+                res = supabase.table("as_history").select("*").range(offset, offset+999).execute()
                 if not res.data: break
-                db_data.extend(res.data); offset += 1000
-            db_dict = {item['압축코드']: item['id'] for item in db_data}
+                db_res.extend(res.data); offset += 1000
+            db_df = pd.DataFrame(db_res)
             
-            updates, missing_keys = [], []
-            for _, row in df_out.iterrows():
-                code = row['match_key']
-                if code in db_dict:
-                    dest, out_dt = str(row.iloc[15]).strip(), to_pure_date(row.iloc[6])
-                    upd = {"id": db_dict[code], "상태": "출고 완료"}
+            updates = []
+            matched_count = 0
+            
+            # 2. 정밀 매칭: 출고일과 가장 가까운 이전 입고일을 매칭
+            for _, o_row in df_out.iterrows():
+                code = o_row['match_key']
+                out_dt = o_row['out_date']
+                if not code or not out_dt: continue
+                
+                # 동일 압축코드의 입고 이력 필터링
+                hits = db_df[(db_df['압축코드'] == code) & (db_df['입고일'] <= out_dt)]
+                
+                if not hits.empty:
+                    # 출고일보다 과거인 것 중 가장 최근 것(max date) 선택
+                    target = hits.sort_values(by='입고일', ascending=False).iloc[0]
+                    target_id = target['id']
+                    
+                    dest = str(o_row.iloc[15]).strip()
+                    upd = {"id": int(target_id), "상태": "출고 완료"}
                     if "디지타스" in dest:
                         upd["디지타스_출고일"] = out_dt
                     else:
                         upd["벤더_출고일"] = out_dt
                         upd["벤더_출고지"] = dest
                     updates.append(upd)
-                elif code != "":
-                    missing_keys.append(code)
+                    matched_count += 1
             
+            # 3. DB 업데이트 (배치 처리)
             if updates:
                 for i in range(0, len(updates), 50):
                     supabase.table("as_history").upsert(updates[i:i+50]).execute()
                     time.sleep(0.02)
-                st.success(f"✅ 매칭 성공: {len(updates):,}건")
-            
-            if missing_keys:
-                st.warning(f"⚠️ DB에 없는 압축코드 {len(set(missing_keys)):,}종 발견 (입고 누락 가능성)")
-                with st.expander("누락된 코드 리스트 확인"):
-                    st.write(list(set(missing_keys)))
+                st.success(f"✅ {matched_count:,}건 정밀 매칭 완료!")
         except Exception as e: st.error(f"출고 오류: {e}")
 
 # [TAB 3] 리포트
@@ -167,14 +176,14 @@ with tab3:
     if st.button("📊 최종 리포트 다운로드", use_container_width=True):
         all_d, offset = [], 0
         while True:
-            res = supabase.table("as_history").select("*").order("id").range(offset, offset+999).execute()
+            res = supabase.table("as_history").select("*").order("입고일").range(offset, offset+999).execute()
             if not res.data: break
             all_d.extend(res.data); offset += 1000
         if all_d:
-            df = pd.DataFrame(all_d).drop_duplicates(subset=['압축코드'], keep='last')
+            df = pd.DataFrame(all_d)
             target_cols = ["입고일", "자재번호", "자재명", "규격", "공급업체명", "분류구분", "대상여부", "압축코드", "디지타스_출고일", "벤더_출고일", "벤더_출고지", "상태"]
             df = df[[c for c in target_cols if c in df.columns]]
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                 df.to_excel(wr, index=False)
-            st.download_button("📥 엑셀 받기", output.getvalue(), f"AS_TAT_Report.xlsx")
+            st.download_button("📥 엑셀 받기", output.getvalue(), "AS_TAT_Report.xlsx")
