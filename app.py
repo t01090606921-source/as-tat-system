@@ -14,14 +14,14 @@ except Exception as e:
     st.error("⚠️ Supabase 설정(Secrets)을 확인해주세요.")
 
 st.set_page_config(page_title="AS TAT 시스템", layout="wide")
-st.title("📊 AS TAT 통합 관리 시스템 (이중 출고 추적 모드)")
+st.title("📊 AS TAT 통합 관리 시스템 (출고 누락 방지 버전)")
 
-# [정제 함수]
+# [핵심 함수] 매칭률을 극대화하는 정밀 정제 (영문, 숫자, 하이픈만 남김)
 def ultimate_sanitize(val, length=100):
     if pd.isna(val) or str(val).strip() == "": return ""
-    s = str(val).strip().upper()
-    s = "".join(s.split())
-    s = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', s)
+    s = str(val).strip().upper()  # 무조건 대문자
+    s = "".join(s.split())        # 모든 공백 제거
+    s = re.sub(r'[^A-Z0-9-]', '', s) # 영문, 숫자, 하이픈 외 모든 특수문자/한글 제거
     return s[:length]
 
 def to_pure_date(val):
@@ -46,7 +46,7 @@ with st.sidebar:
         st.metric("DB 내 데이터", f"{res.count if res.count is not None else 0:,} 건")
     
     st.divider()
-    if st.button("💣 DB 데이터 강제 초기화", type="primary", use_container_width=True):
+    if st.button("💣 DB 전체 데이터 초기화", type="primary", use_container_width=True):
         msg = st.empty()
         while True:
             fetch = supabase.table("as_history").select("id").limit(1000).execute()
@@ -62,7 +62,7 @@ tab0, tab1, tab2, tab3 = st.tabs(["🗂️ 마스터 관리", "📥 전량 입�
 # [TAB 0] 마스터 관리
 with tab0:
     st.subheader("📋 마스터 정보 등록")
-    m_file = st.file_uploader("마스터 파일(G열: 규격)", type=['csv', 'xlsx'], key="m_v_final")
+    m_file = st.file_uploader("마스터 파일 업로드", type=['csv', 'xlsx'], key="m_v_final")
     if m_file and st.button("🔄 마스터 데이터 로드"):
         m_df = smart_read_csv(m_file) if m_file.name.endswith('.csv') else pd.read_excel(m_file).fillna("")
         st.session_state.master_lookup = {
@@ -111,61 +111,54 @@ with tab1:
                 })
             
             prog = st.progress(0); status_txt = st.empty()
-            chunk_size = 50
-            for i in range(0, len(recs), chunk_size):
-                chunk = recs[i:i+chunk_size]
-                try:
-                    supabase.table("as_history").upsert(chunk, on_conflict="압축코드").execute()
-                except Exception as e:
-                    st.warning(f"⏳ {i}번 세트 서버 재시도 중...")
-                    time.sleep(1)
-                    supabase.table("as_history").upsert(chunk, on_conflict="압축코드").execute()
-                prog.progress(min((i+chunk_size)/len(recs), 1.0))
-            st.balloons(); st.success("✅ 입고 완료!")
+            for i in range(0, len(recs), 50):
+                chunk = recs[i:i+50]
+                supabase.table("as_history").upsert(chunk, on_conflict="압축코드").execute()
+                prog.progress(min((i+50)/len(recs), 1.0))
+            st.success("✅ 입고 완료!")
 
-# [TAB 2] 출고 매칭 (이중 출고 로직 핵심 수정)
+# [TAB 2] 출고 매칭 (누락 원인 추적 강화)
 with tab2:
-    st.subheader("📤 AS 고속 출고 매칭 (디지타스/벤더 개별 추적)")
-    o_file = st.file_uploader("출고 CSV (P열: 출고지, G열: 출고일)", type=['csv'], key="o_v_final")
+    st.subheader("📤 AS 고속 출고 매칭 (정밀 모드)")
+    o_file = st.file_uploader("출고 CSV", type=['csv'], key="o_v_final")
     if o_file and st.button("🚀 매칭 시작"):
         try:
             df_out = smart_read_csv(o_file)
             df_out['match_key'] = df_out.iloc[:, 10].apply(lambda x: ultimate_sanitize(x, 100))
             
-            # DB 현황 로드
+            # DB 데이터 로드
             db_data, offset = [], 0
             while True:
-                res = supabase.table("as_history").select("id, 압축코드, 디지타스_출고일, 벤더_출고일").range(offset, offset+999).execute()
+                res = supabase.table("as_history").select("id, 압축코드").range(offset, offset+999).execute()
                 if not res.data: break
                 db_data.extend(res.data); offset += 1000
-            db_dict = {item['압축코드']: item for item in db_data}
+            db_dict = {item['압축코드']: item['id'] for item in db_data}
             
-            updates = []
+            updates, missing_keys = [], []
             for _, row in df_out.iterrows():
                 code = row['match_key']
                 if code in db_dict:
-                    dest = str(row.iloc[15]).strip() # P열: 출고지
-                    out_dt = to_pure_date(row.iloc[6]) # G열: 출고일
-                    curr_item = db_dict[code]
-                    
-                    update_payload = {"id": curr_item['id']}
-                    
-                    # 로직 분리: 디지타스 출고건과 벤더 출고건을 각각 독립적으로 업데이트
+                    dest, out_dt = str(row.iloc[15]).strip(), to_pure_date(row.iloc[6])
+                    upd = {"id": db_dict[code], "상태": "출고 완료"}
                     if "디지타스" in dest:
-                        update_payload["디지타스_출고일"] = out_dt
+                        upd["디지타스_출고일"] = out_dt
                     else:
-                        update_payload["벤더_출고일"] = out_dt
-                        update_payload["벤더_출고지"] = dest
-                    
-                    update_payload["상태"] = "출고 완료"
-                    updates.append(update_payload)
+                        upd["벤더_출고일"] = out_dt
+                        upd["벤더_출고지"] = dest
+                    updates.append(upd)
+                elif code != "":
+                    missing_keys.append(code)
             
             if updates:
-                # 동일 압축코드에 대해 여러 출고건이 있을 수 있으므로 upsert로 누적 업데이트
                 for i in range(0, len(updates), 50):
                     supabase.table("as_history").upsert(updates[i:i+50]).execute()
-                    time.sleep(0.05)
-                st.success(f"✅ {len(updates):,}건의 출고 정보가 매칭되었습니다. (이중 출고 포함)")
+                    time.sleep(0.02)
+                st.success(f"✅ 매칭 성공: {len(updates):,}건")
+            
+            if missing_keys:
+                st.warning(f"⚠️ DB에 없는 압축코드 {len(set(missing_keys)):,}종 발견 (입고 누락 가능성)")
+                with st.expander("누락된 코드 리스트 확인"):
+                    st.write(list(set(missing_keys)))
         except Exception as e: st.error(f"출고 오류: {e}")
 
 # [TAB 3] 리포트
@@ -181,11 +174,7 @@ with tab3:
             df = pd.DataFrame(all_d).drop_duplicates(subset=['압축코드'], keep='last')
             target_cols = ["입고일", "자재번호", "자재명", "규격", "공급업체명", "분류구분", "대상여부", "압축코드", "디지타스_출고일", "벤더_출고일", "벤더_출고지", "상태"]
             df = df[[c for c in target_cols if c in df.columns]]
-            
-            # TAT 계산 (참고용)
-            df['벤더_TAT'] = (pd.to_datetime(df['벤더_출고일']) - pd.to_datetime(df['입고일'])).dt.days
-            
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as wr:
                 df.to_excel(wr, index=False)
-            st.download_button("📥 정규 리포트 받기", output.getvalue(), f"AS_TAT_Final_{time.strftime('%m%d')}.xlsx")
+            st.download_button("📥 엑셀 받기", output.getvalue(), f"AS_TAT_Report.xlsx")
